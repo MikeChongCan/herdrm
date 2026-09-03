@@ -152,6 +152,69 @@ Herdr 的一大核心特色是能感知 AI Agent 的状态（`working`, `idle`, 
 
 ---
 
+### 3.6 开发工作流：一套代码，全程在 macOS 上调试
+
+**结论**：约 95% 的核心逻辑与交互可以在 macOS 上完成端到端调试，剩下的 5% 是纯系统 API 差异，交给 CI 编译 + 发布前一次真机点检即可。不需要长期守在 Windows 机器前折腾环境。
+
+#### A. 为什么同一套代码能在 macOS 上跑通
+
+| 构件 | 跨平台机制 | 在 macOS 上可验证的部分 |
+| :--- | :--- | :--- |
+| 终端底座 | `portable-pty` 对上层暴露同一套 API：Unix 走 `openpty()`/`forkpty()`，Windows 走 `CreatePseudoConsole()` | 拉起 `zsh` / `claude` 调试管道读写、动态 resize、进程退出监控 |
+| 通信协议 | 纯 Rust + `tokio`，JSON-RPC 与字节流与 OS 无关 | 在 Mac 上跑 Bridge，用 iPhone 连本机局域网端口做真机全流程实测 |
+| Agent 状态机 | `ProcessInspector` trait，macOS 用 `sysinfo`/`libproc`，Windows 用 `CreateToolhelp32Snapshot` | ANSI 提示符正则、思考动画探测、状态流转的全部单元测试 |
+| GPUI 桌面端 | GPUI 本身诞生于 macOS（Metal），后扩展 Windows (D3D11/12) 与 Linux | 界面与交互逻辑全部调通；Mac 上增量编译更快，开发体验更好 |
+
+上层业务代码里 PTY 的调用形态两端完全一致：
+
+```rust
+let pty_system = native_pty_system();
+let pair = pty_system.openpty(PtySize { rows, cols, ..Default::default() })?;
+// 读写数据流、resize、进程退出监控：Mac 与 Windows 接口统一
+```
+
+#### B. 端口与适配器（Hexagonal）分层
+
+```
+┌────────────────────────────────────────────┐
+│        通用核心层（100% 在 Mac 上调试）        │
+│  1. tokio 异步网络与 RPC 协议序列化           │
+│  2. 会话多路复用与环形 Scrollback 缓冲        │
+│  3. Agent 状态判定机（Regex & Heartbeat）    │
+│  4. attach CLI 的标准输入输出对接             │
+└─────────────────────┬──────────────────────┘
+                      │
+┌─────────────────────┴──────────────────────┐
+│           系统适配层（编译期切换）             │
+│   #[cfg(unix)]            #[cfg(windows)]  │
+│   - Unix openpty          - Windows ConPTY │
+│   - 默认 Shell /bin/zsh   - pwsh.exe / cmd │
+│   - libproc 进程检测       - Win32 Toolhelp │
+│   - 无（进程组即可）        - Job Object 回收 │
+└────────────────────────────────────────────┘
+```
+
+建议的 crate 划分：`herdr-bridge-core`（无 `#[cfg]`，承载全部业务逻辑与测试）+ `herdr-bridge-sys-unix` / `herdr-bridge-sys-windows`（仅实现 trait）+ `herdr-bridge`（bin，按平台装配）。核心层不允许直接出现平台条件编译，否则 macOS 上的测试覆盖率会被悄悄掏空。
+
+#### C. 日常闭环
+
+1. **Mac 本地开发**：`cargo run -- daemon` 起本地 Bridge → iPhone 上的 `HerdrMobile` 连 Mac 局域网地址 → 验证终端附着、SGR 触摸滚动、双指缩放、状态指示灯、断线重连。
+2. **单元测试**：`cargo test` 在 Mac 上跑通核心层所有分支（状态机、Scrollback、协议编解码）。
+3. **跨平台构建交给 CI**：GitHub Actions 加 `windows-latest` job 跑 `cargo check` / `cargo test -p herdr-bridge-core` / `cargo build --release`，保证 Windows 适配层始终可编译。
+4. **发布前一次真机点检**：把 CI 产出的单文件 `.exe` 在 Windows 上跑一遍。
+
+#### D. 必须在真 Windows 上验证的 5%
+
+macOS 调试无法覆盖以下项，别指望在 Mac 上发现它们：
+
+- ConPTY 的宽字符 / Emoji 光标错位与 UTF-8 代码页（`SetConsoleOutputCP(65001)`）行为；
+- Job Object 的进程树回收与句柄泄漏；
+- Windows 命令行参数引用/转义规则（`CreateProcessW` 的单字符串语义与 Unix `argv` 差异明显）；
+- OpenSSH for Windows 的 `exec` 通道行为、默认 Shell 与 PATH；
+- 路径分隔符、盘符与 UNC 路径在 RPC 载荷里的往返。
+
+---
+
 ## 4. 分阶段实施路线图 (Milestones)
 
 ```mermaid
@@ -225,3 +288,5 @@ gantt
 1. **轻量、聚焦的 Rust 转发核心（Bridge Daemon）**：负责底层 ConPTY 抽象和网络接口，成本低、见效快；
 2. **现有的 Swift iOS 客户端（HerdrMobile）**：只需轻微适配即可直接覆盖 Windows，实现“一端控全端”；
 3. **前瞻性的 Rust GPUI 桌面客户端**：在 Windows 平台上实现完全不输 macOS 的顶级视觉与操作体验。
+
+而在工程节奏上（见 §3.6），整个 Windows 版本可以**在 macOS 上开发和调试**：核心层零平台条件编译、`portable-pty` 抹平 PTY 差异、Bridge 起在 Mac 上直接用 iPhone 真机联调，Windows 只作为条件编译的目标平台由 CI 守住编译与测试。

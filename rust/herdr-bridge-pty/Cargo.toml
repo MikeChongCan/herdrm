@@ -1,0 +1,12 @@
+[package]
+name = "herdr-bridge-pty"
+description = "Cross-platform PtyBackend for the herdr bridge, over portable-pty (Unix PTY / Windows ConPTY)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+herdr-bridge-core.workspace = true
+anyhow.workspace = true
+portable-pty.workspace = true

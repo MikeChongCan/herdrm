@@ -1,0 +1,24 @@
+[package]
+name = "herdr-desktop"
+description = "Herdr desktop client prototype in Rust GPUI — developed on macOS, targets Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+herdr-bridge-core.workspace = true
+herdr-bridge-pty.workspace = true
+anyhow.workspace = true
+
+# Pinned to the exact Zed commit: gpui is not released on crates.io (the crate
+# of that name there is an unrelated 8-line placeholder), so a floating git
+# dependency would silently change the UI toolkit under us.
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "59b0c714ff054c7919b325b3bb281482c1e4f732" }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "59b0c714ff054c7919b325b3bb281482c1e4f732" }
+
+[target.'cfg(unix)'.dependencies]
+herdr-bridge-sys-unix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+herdr-bridge-sys-windows.workspace = true

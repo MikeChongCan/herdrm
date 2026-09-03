@@ -1,0 +1,12 @@
+[package]
+name = "herdr-bridge-core"
+description = "Platform-agnostic core for the herdr bridge: protocol, panes, scrollback, agent status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

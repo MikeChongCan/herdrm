@@ -194,13 +194,23 @@ let pair = pty_system.openpty(PtySize { rows, cols, ..Default::default() })?;
 └────────────────────────────────────────────┘
 ```
 
-建议的 crate 划分：`herdr-bridge-core`（无 `#[cfg]`，承载全部业务逻辑与测试）+ `herdr-bridge-sys-unix` / `herdr-bridge-sys-windows`（仅实现 trait）+ `herdr-bridge`（bin，按平台装配）。核心层不允许直接出现平台条件编译，否则 macOS 上的测试覆盖率会被悄悄掏空。
+实际落地的 crate 划分（见 `rust/`，已实现）：
+
+| crate | 是否含 `#[cfg]` | 职责 |
+| :--- | :--- | :--- |
+| `herdr-bridge-core` | **否** | 协议（NDJSON / `params` 必填）、Pane 多路复用、Scrollback 环形缓冲、VT 转义过滤、Agent 状态机、平台 trait 定义 |
+| `herdr-bridge-pty` | **否** | `PtyBackend` 的唯一实现，基于 `portable-pty`。PTY 本身就是跨平台的，因此不属于适配层，不在两个 sys crate 里重复 |
+| `herdr-bridge-sys-unix` | 仅 crate 级 `#![cfg(unix)]` | 登录 shell、`ps` 进程快照 |
+| `herdr-bridge-sys-windows` | 仅 Win32 模块 | shell 选择策略（**纯逻辑，在 macOS 上就能测**）、Toolhelp 进程快照、Job Object |
+| `herdr-desktop` | 仅一个 `platform_profile()` 函数 | GPUI 客户端 |
+
+两条硬性约束：核心层不允许出现平台条件编译，否则 macOS 上的测试覆盖率会被悄悄掏空；`herdr-bridge-sys-windows` 的 `windows-sys` 依赖挂在 `[target.'cfg(windows)'.dependencies]` 下，且 Win32 代码全部 `#[cfg(windows)]`，因此它在 macOS 上编译为「只剩纯逻辑」的 crate，`cargo build --workspace` 始终是绿的。
 
 #### C. 日常闭环
 
-1. **Mac 本地开发**：`cargo run -- daemon` 起本地 Bridge → iPhone 上的 `HerdrMobile` 连 Mac 局域网地址 → 验证终端附着、SGR 触摸滚动、双指缩放、状态指示灯、断线重连。
-2. **单元测试**：`cargo test` 在 Mac 上跑通核心层所有分支（状态机、Scrollback、协议编解码）。
-3. **跨平台构建交给 CI**：GitHub Actions 加 `windows-latest` job 跑 `cargo check` / `cargo test -p herdr-bridge-core` / `cargo build --release`，保证 Windows 适配层始终可编译。
+1. **Mac 本地开发**：`cd rust && cargo run -p herdr-desktop` 直接起 GPUI 客户端（当前原型在本机拉起 PTY；接入 Bridge RPC 后即可换成远端 Pane）。
+2. **单元测试**：`cargo test --workspace` 在 Mac 上跑通核心层所有分支（状态机、Scrollback、VT 过滤、协议编解码、按键编码），外加 `herdr-bridge-pty` 的真实 PTY 集成测试。
+3. **跨平台构建交给 CI**：`.github/workflows/rust.yml` 的 `macos-26 / ubuntu-latest / windows-latest` 三平台矩阵跑同一套 `cargo test`，并在 macOS + Windows 上构建 `herdr-desktop`；`RUSTFLAGS: -D warnings` 保证 Windows 适配层不会悄悄腐烂。
 4. **发布前一次真机点检**：把 CI 产出的单文件 `.exe` 在 Windows 上跑一遍。
 
 #### D. 必须在真 Windows 上验证的 5%

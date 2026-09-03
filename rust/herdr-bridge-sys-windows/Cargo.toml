@@ -1,0 +1,21 @@
+[package]
+name = "herdr-bridge-sys-windows"
+description = "Windows platform adapter for the herdr bridge: default shell, Toolhelp process inspection, Job Objects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+herdr-bridge-core.workspace = true
+anyhow.workspace = true
+
+# Only pulled in when actually targeting Windows, so `cargo build --workspace`
+# on macOS never fetches or builds the Win32 bindings.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

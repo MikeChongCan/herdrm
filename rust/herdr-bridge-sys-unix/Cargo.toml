@@ -1,0 +1,11 @@
+[package]
+name = "herdr-bridge-sys-unix"
+description = "Unix platform adapter for the herdr bridge: default shell and process inspection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+herdr-bridge-core.workspace = true
+anyhow.workspace = true

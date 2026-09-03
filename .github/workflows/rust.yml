@@ -1,0 +1,90 @@
+name: Rust bridge & desktop
+
+# The macOS-first workflow from docs/WINDOWS_SUPPORT_PLAN.md §3.6: development
+# and debugging happen on macOS, and this matrix is what keeps the Windows
+# adapter honest — it is the only place the Win32 code is ever compiled.
+
+on:
+  push:
+    branches: [main]
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on warnings so the Windows adapter cannot rot quietly.
+  RUSTFLAGS: "-D warnings"
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  # The portable half: core logic plus the real PTY, on every host. These are
+  # the tests that must pass identically everywhere.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Excludes herdr-desktop: GPUI needs system graphics libraries, and it is
+      # built separately below.
+      - name: Test bridge crates
+        run: >
+          cargo test
+          -p herdr-bridge-core
+          -p herdr-bridge-pty
+          -p herdr-bridge-sys-unix
+          -p herdr-bridge-sys-windows
+
+      - name: Clippy
+        run: >
+          cargo clippy --all-targets
+          -p herdr-bridge-core
+          -p herdr-bridge-pty
+          -p herdr-bridge-sys-unix
+          -p herdr-bridge-sys-windows
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # The GPUI client. Built, not tested: it needs a display to run.
+  desktop:
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build desktop client
+        run: cargo build -p herdr-desktop

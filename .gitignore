@@ -1,12 +1,78 @@
-.DS_Store
-build/
-design/
+# ---------------------------------------------------------------------------
+# Generated project files
+# ---------------------------------------------------------------------------
+# HerdrM.xcodeproj is produced by XcodeGen from project.yml — regenerate with
+# `xcodegen generate` (the Makefile does it for you). Never commit it.
 HerdrM.xcodeproj/
-Packages/HerdrKit/.build/
+# Written at build time from project.yml.
 Sources/HerdrM/Info.plist
-*.xcuserstate
-.swiftpm/
-xcuserdata/
-build-rel/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build/
 build-ios/
+build-rel/
 build-release/
+DerivedData/
+*.xcarchive
+*.ipa
+*.app.dSYM.zip
+*.moved-aside
+*.hmap
+
+# ---------------------------------------------------------------------------
+# Swift Package Manager
+# ---------------------------------------------------------------------------
+.build/
+.swiftpm/
+# Package.resolved is deliberately NOT ignored: this repo ships apps, so the
+# exact dependency revisions belong in version control.
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+# See also rust/.gitignore. Cargo.lock is intentionally tracked — the workspace
+# builds binaries, and it is what pins the GPUI git revision.
+target/
+*.rs.bk
+*.pdb
+
+# ---------------------------------------------------------------------------
+# Xcode user state
+# ---------------------------------------------------------------------------
+xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# ---------------------------------------------------------------------------
+# Design canvas working files
+# ---------------------------------------------------------------------------
+# Kept out of the repo deliberately; the canvas is published as an Artifact.
+design/
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+.DS_Store
+# AppleDouble sidecars — this repo lives on an external volume, where macOS
+# writes these next to real files.
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+
+# ---------------------------------------------------------------------------
+# Editors and tooling
+# ---------------------------------------------------------------------------
+.idea/
+*.swp
+*~
+# Machine-local agent settings; the shared .claude/ config stays tracked.
+.claude/settings.local.json

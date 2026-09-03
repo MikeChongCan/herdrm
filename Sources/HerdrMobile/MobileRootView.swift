@@ -10,25 +10,28 @@ struct MobileRootView: View {
         NavigationSplitView {
             SidebarListView(model: model)
         } detail: {
+            // The screen takes the device session, not its transport: a
+            // reconnect swaps the transport out, and this view's identity
+            // (the pane) deliberately survives that.
             if let agent = model.selectedAgent,
-               let transport = model.selectedSession?.transport {
+               let session = model.selectedSession {
                 MobileTerminalScreen(
-                    transport: transport,
+                    provider: session,
                     target: .agent(paneID: agent.paneID),
                     paneID: agent.paneID,
                     title: agent.title(tabLabel: model.tabLabel(for: agent))
                 )
-                .id(agent.paneID)
+                .id(model.attachIdentity(paneID: agent.paneID))
             } else if let pane = model.selectedTerminalPane,
                       let terminalID = pane.terminalID,
-                      let transport = model.selectedSession?.transport {
+                      let session = model.selectedSession {
                 MobileTerminalScreen(
-                    transport: transport,
+                    provider: session,
                     target: .terminal(terminalID: terminalID),
                     paneID: pane.paneID,
                     title: model.terminalLabel(for: pane)
                 )
-                .id(pane.paneID)
+                .id(model.attachIdentity(paneID: pane.paneID))
             } else {
                 ContentUnavailableView(
                     String(localized: "No Agent Selected"),

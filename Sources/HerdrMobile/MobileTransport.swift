@@ -10,7 +10,28 @@ protocol MobileTransport: Sendable {
     func request(method: String, params: JSONValue) async throws -> JSONValue
     func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
     func openTerminal(command: String, columns: Int, rows: Int) async throws -> SSHPTYChannel
+    /// Whether this transport can still carry an RPC. iOS suspension can leave
+    /// libssh2 believing it is connected while the socket underneath is dead,
+    /// so this must prove liveness on the wire rather than read a flag.
+    func isHealthy() async -> Bool
     func close() async
+}
+
+/// Resolves the *current* transport for a device at the moment of use.
+///
+/// An attach outlives the `SSHConnection` it started on — a background pass
+/// kills the session and the reconnect builds a new one — so anything holding a
+/// transport across suspension must re-resolve through this instead of keeping
+/// the reference it was handed at construction.
+@MainActor
+protocol MobileTransportProvider: AnyObject {
+    /// Bumped every time the held transport is replaced or dropped. Channels
+    /// opened on an earlier revision are dead with the transport they came from.
+    var transportRevision: Int { get }
+
+    /// The transport to use now, reconnecting first when the held one is gone
+    /// or cannot prove itself.
+    func currentTransport() async throws -> MobileTransport
 }
 
 extension MobileTransport {
@@ -33,9 +54,12 @@ enum MobileTransportError: LocalizedError {
     case hostKeyChanged(fingerprint: String)
     case missingPassword
     case homeProbeFailed
+    case notConnected(String)
 
     var errorDescription: String? {
         switch self {
+        case .notConnected(let reason):
+            return reason
         case .hostKeyChanged(let fingerprint):
             return String(
                 localized: "This device's SSH host key changed (\(fingerprint)). If the host was reinstalled, remove and re-add the device."
@@ -56,6 +80,10 @@ final class SSHDirectTransport: MobileTransport {
     private let socketPath: String
 
     private static let requestTimeout: Duration = .seconds(15)
+    /// A liveness probe must not inherit the request budget: it runs while the
+    /// user is staring at a stalled screen, and a dead socket has to be called
+    /// dead quickly so the rebuild can start.
+    private static let probeTimeout: Duration = .seconds(4)
 
     private init(connection: SSHConnection, socketPath: String) {
         self.connection = connection
@@ -133,6 +161,14 @@ final class SSHDirectTransport: MobileTransport {
     }
 
     func request(method: String, params: JSONValue) async throws -> JSONValue {
+        try await request(method: method, params: params, timeout: Self.requestTimeout)
+    }
+
+    private func request(
+        method: String,
+        params: JSONValue,
+        timeout: Duration
+    ) async throws -> JSONValue {
         let payload = SocketRPC.encodeRequest(
             id: UUID().uuidString, method: method, params: params
         )
@@ -141,7 +177,7 @@ final class SSHDirectTransport: MobileTransport {
             reply = try await connection.exchangeStreamLocal(
                 socketPath: socketPath,
                 request: payload,
-                timeout: Self.requestTimeout
+                timeout: timeout
             )
         } catch SSHError.streamLocalOpenFailed {
             throw HerdrError.remoteHerdrDown(target: "device", socketPath: socketPath)
@@ -151,6 +187,22 @@ final class SSHDirectTransport: MobileTransport {
         var line = reply
         if line.last == 0x0A { line.removeLast() }
         return try SocketRPC.decodeResponse(line)
+    }
+
+    /// `isConnected` only reports what libssh2 believes, which after an iOS
+    /// suspension can be wrong in the one direction that matters, so the flag
+    /// is a cheap pre-filter and the real answer is a round trip: a fresh
+    /// streamlocal channel plus a `ping` on a short budget.
+    func isHealthy() async -> Bool {
+        guard await connection.isConnected else { return false }
+        do {
+            _ = try await request(
+                method: "ping", params: .object([:]), timeout: Self.probeTimeout
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error> {

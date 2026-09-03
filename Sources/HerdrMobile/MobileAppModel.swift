@@ -17,8 +17,16 @@ final class MobileDeviceSession {
     var state: MobileConnectionState = .idle
     var snapshot: SessionSnapshot?
     private(set) var transport: MobileTransport?
+    /// Bumped on every transport swap — see `MobileTransportProvider`.
+    private(set) var transportRevision = 0
     private var eventTask: Task<Void, Never>?
     private var refreshPending = false
+    /// The in-flight connect, so a foreground pass, a Reconnect tap and an
+    /// attach all resolving at once share one rebuild instead of racing.
+    private var connectTask: Task<Void, Never>?
+    /// Set when iOS backgrounds us. A held session stops being trustworthy from
+    /// that moment until something proves it again.
+    private var wasSuspended = false
 
     var onChange: (() -> Void)?
 
@@ -26,40 +34,106 @@ final class MobileDeviceSession {
         self.device = device
     }
 
+    /// This session's state as the platform-neutral recovery policy sees it.
+    var liveness: ConnectionLiveness {
+        switch state {
+        case .idle: return .absent
+        case .connecting: return .establishing
+        case .connected: return .established
+        case .failed: return .failed
+        }
+    }
+
+    /// Tears the held transport down and builds a fresh one. Never reuses a
+    /// session: a half-open libssh2 session still reports itself connected, so
+    /// "already connected" is not a safe reason to skip the rebuild.
     func connect() async {
-        guard case .connecting = state else {
-            state = .connecting
-            onChange?()
-            do {
-                let transport = try await SSHDirectTransport.connect(device: device)
-                let pong = try await transport.request(
-                    method: "ping", params: .object([:]), as: PingResult.self
-                )
-                guard pong.protocolVersion >= 17 else {
-                    await transport.close()
-                    throw HerdrError.incompatibleProtocol(pong.protocolVersion)
-                }
-                self.transport = transport
-                state = .connected(version: pong.version)
-                await refresh()
-                startEventPump()
-            } catch {
-                state = .failed((error as? LocalizedError)?.errorDescription ?? "\(error)")
-            }
-            onChange?()
+        if let connectTask {
+            await connectTask.value
             return
+        }
+        let task = Task { await self.performConnect() }
+        connectTask = task
+        await task.value
+        connectTask = nil
+    }
+
+    private func performConnect() async {
+        // The old session's channels — events, every attach PTY — die with it.
+        await teardown()
+        state = .connecting
+        onChange?()
+        do {
+            let transport = try await SSHDirectTransport.connect(device: device)
+            let pong = try await transport.request(
+                method: "ping", params: .object([:]), as: PingResult.self
+            )
+            guard pong.protocolVersion >= 17 else {
+                await transport.close()
+                throw HerdrError.incompatibleProtocol(pong.protocolVersion)
+            }
+            setTransport(transport)
+            wasSuspended = false
+            state = .connected(version: pong.version)
+            await refresh()
+            startEventPump()
+        } catch {
+            state = .failed((error as? LocalizedError)?.errorDescription ?? "\(error)")
+        }
+        onChange?()
+    }
+
+    /// iOS is about to stop servicing our sockets and may drop the TCP
+    /// connection outright while we are suspended.
+    func noteSuspended() {
+        wasSuspended = true
+    }
+
+    /// Foreground entry point: proves the held session and rebuilds it when the
+    /// proof fails. Returns once the connection is either usable or failed.
+    func resumeIfNeeded() async {
+        switch ConnectionRecoveryPolicy.onForeground(
+            liveness: liveness, wasSuspended: wasSuspended
+        ) {
+        case .wait:
+            await connectTask?.value
+        case .reuse:
+            wasSuspended = false
+        case .rebuild:
+            await connect()
+        case .probe:
+            let healthy = await transport?.isHealthy() ?? false
+            switch ConnectionRecoveryPolicy.afterProbe(succeeded: healthy) {
+            case .rebuild:
+                await connect()
+            default:
+                wasSuspended = false
+            }
         }
     }
 
     func disconnect() async {
-        eventTask?.cancel()
-        eventTask = nil
-        if let transport {
-            await transport.close()
-        }
-        transport = nil
+        connectTask?.cancel()
+        connectTask = nil
+        await teardown()
         state = .idle
         onChange?()
+    }
+
+    /// Drops every piece of state cached on the current transport. This is the
+    /// teardown that popping and re-pushing the terminal screen used to do by
+    /// accident; the reconnect path now does it deliberately.
+    private func teardown() async {
+        eventTask?.cancel()
+        eventTask = nil
+        guard let held = transport else { return }
+        setTransport(nil)
+        await held.close()
+    }
+
+    private func setTransport(_ new: MobileTransport?) {
+        transport = new
+        transportRevision += 1
     }
 
     func refresh() async {
@@ -102,6 +176,26 @@ final class MobileDeviceSession {
         try? await Task.sleep(for: .milliseconds(300))
         refreshPending = false
         await refresh()
+    }
+}
+
+extension MobileDeviceSession: MobileTransportProvider {
+    /// Resolving always runs the foreground check first, so a caller that has
+    /// been asleep never gets handed the session it remembers.
+    func currentTransport() async throws -> MobileTransport {
+        await resumeIfNeeded()
+        if let transport { return transport }
+        await connect()
+        guard let transport else {
+            let reason: String
+            if case .failed(let message) = state {
+                reason = message
+            } else {
+                reason = String(localized: "Not connected to this device.")
+            }
+            throw MobileTransportError.notConnected(reason)
+        }
+        return transport
     }
 }
 
@@ -152,6 +246,22 @@ final class MobileAppModel {
     func connectSelected() {
         guard let session = selectedSession else { return }
         Task { await session.connect() }
+    }
+
+    /// Backgrounding: mark every session suspect. Nothing is torn down here —
+    /// iOS gives no useful window for it, and the foreground probe is what
+    /// decides whether a session survived.
+    func noteSuspended() {
+        for session in sessions.values {
+            session.noteSuspended()
+        }
+    }
+
+    /// Foregrounding: health-check the visible device and rebuild if the
+    /// suspension killed it.
+    func resumeSelected() {
+        guard let session = selectedSession else { return }
+        Task { await session.resumeIfNeeded() }
     }
 
     func selectDevice(_ id: UUID) {
@@ -243,6 +353,13 @@ final class MobileAppModel {
         _ = revision
         return selectedSession?.snapshot?.workspaces
             .first { $0.workspaceID == workspaceID }?.label ?? workspaceID
+    }
+
+    /// View identity for an attach screen. Pane IDs are only unique within a
+    /// device, so switching devices must rebuild the screen — but a reconnect
+    /// to the same device must not.
+    func attachIdentity(paneID: String) -> String {
+        "\(selectedDeviceID?.uuidString ?? "-")/\(paneID)"
     }
 
     var selectedAgent: AgentInfo? {

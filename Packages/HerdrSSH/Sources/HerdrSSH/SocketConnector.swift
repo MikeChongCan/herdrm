@@ -61,6 +61,8 @@ enum SocketConnector {
             throw SSHError.connectionFailed
         }
 
+        configureKeepalive(descriptor: descriptor, type: address.type)
+
         let result = address.bytes.withUnsafeBytes { bytes -> Int32 in
             guard let baseAddress = bytes.baseAddress else { return -1 }
             return Darwin.connect(
@@ -87,6 +89,41 @@ enum SocketConnector {
 
         ownsDescriptor = false
         return descriptor
+    }
+
+    /// Without this a session that dies while the process is suspended — iOS
+    /// stops servicing the socket, the peer or a NAT drops the flow — comes
+    /// back half-open: reads simply never return, so a long-lived channel
+    /// (an attach's PTY, the event stream) hangs instead of failing.
+    ///
+    /// libssh2's own `libssh2_keepalive_config` is deliberately not used: it
+    /// only arms `libssh2_keepalive_send`, which nothing in this package is
+    /// positioned to call on a schedule. TCP keepalive is driven by the kernel
+    /// and needs no pump, and every option below is advisory — a socket that
+    /// refuses one is still perfectly usable.
+    private static func configureKeepalive(descriptor: Int32, type: Int32) {
+        guard type == SOCK_STREAM else { return }
+        setOption(descriptor, SOL_SOCKET, SO_KEEPALIVE, 1)
+        // Idle before the first probe, then probe every 5s, five times: a dead
+        // link is reported within about a minute of the app coming back.
+        setOption(descriptor, IPPROTO_TCP, TCP_KEEPALIVE, 20)
+        setOption(descriptor, IPPROTO_TCP, TCP_KEEPINTVL, 5)
+        setOption(descriptor, IPPROTO_TCP, TCP_KEEPCNT, 5)
+    }
+
+    private static func setOption(
+        _ descriptor: Int32,
+        _ level: Int32,
+        _ name: Int32,
+        _ value: Int32
+    ) {
+        var value = value
+        _ = setsockopt(
+            descriptor,
+            level,
+            name,
+            &value,
+            socklen_t(MemoryLayout<Int32>.size))
     }
 
     private static func checkProgress(

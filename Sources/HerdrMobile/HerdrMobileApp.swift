@@ -19,10 +19,17 @@ struct HerdrMobileApp: App {
             MobileRootView(model: model)
         }
         .onChange(of: scenePhase) { _, phase in
-            // iOS tears sockets down in the background; on return, re-prove the
-            // connection instead of trusting a held one.
-            if phase == .active, model.selectedDeviceID != nil {
-                model.connectSelected()
+            // iOS stops servicing sockets in the background and may drop the
+            // TCP connection outright; on return, re-prove the held session
+            // instead of trusting it. `.inactive` is transient (control centre,
+            // an incoming call) and proves nothing either way.
+            switch phase {
+            case .background:
+                model.noteSuspended()
+            case .active:
+                model.resumeSelected()
+            default:
+                break
             }
         }
     }

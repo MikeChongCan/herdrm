@@ -21,10 +21,24 @@ final class MobileAttachSession: ObservableObject {
     }
 
     @Published var status: Status = .connecting
-    let transport: MobileTransport
+    /// Resolved on every use rather than held: the device's transport is
+    /// replaced wholesale by a reconnect, and this session outlives that.
+    let provider: any MobileTransportProvider
     let target: TerminalAttachTarget
     private var channel: SSHPTYChannel?
     private var readTask: Task<Void, Never>?
+    private var startTask: Task<Void, Never>?
+    /// Bumped by `stop`, so an attach still in flight when the session is torn
+    /// down cannot publish its channel into the session that replaced it.
+    private var startToken = 0
+    /// The transport revision this channel was opened on; `nil` when nothing is
+    /// attached. A reconnect bumps the revision and the channel died with the
+    /// session it came from.
+    private var attachedRevision: Int?
+    /// The last geometry the terminal view reported, so a re-attach comes back
+    /// at the size the user is looking at.
+    private var lastColumns = 80
+    private var lastRows = 24
     /// Bytes before the bootstrap marker are shell rc chatter, not pane output.
     private var sawBootstrapMarker = false
     private var bootstrapBuffer = Data()
@@ -33,8 +47,8 @@ final class MobileAttachSession: ObservableObject {
     /// The herdr pane behind this attach, for key/prompt RPCs.
     let paneID: String
 
-    init(transport: MobileTransport, target: TerminalAttachTarget, paneID: String) {
-        self.transport = transport
+    init(provider: any MobileTransportProvider, target: TerminalAttachTarget, paneID: String) {
+        self.provider = provider
         self.target = target
         self.paneID = paneID
     }
@@ -45,24 +59,77 @@ final class MobileAttachSession: ObservableObject {
     }
 
     func start(columns: Int, rows: Int) {
-        guard channel == nil else { return }
+        guard channel == nil, startTask == nil else { return }
+        lastColumns = max(columns, 20)
+        lastRows = max(rows, 5)
         status = .connecting
         sawBootstrapMarker = false
         bootstrapBuffer.removeAll()
-        Task {
+        let token = startToken
+        startTask = Task {
             do {
+                let transport = try await self.provider.currentTransport()
+                let revision = self.provider.transportRevision
                 let channel = try await transport.openTerminal(
-                    command: MobileAttach.command(target: target),
-                    columns: max(columns, 20),
-                    rows: max(rows, 5)
+                    command: MobileAttach.command(target: self.target),
+                    columns: self.lastColumns,
+                    rows: self.lastRows
                 )
+                // A `stop` while this was in flight means the channel belongs
+                // to nobody: hand it back rather than leak it into the session
+                // that has since replaced this attach.
+                guard self.startToken == token else {
+                    try? await channel.close(timeout: .seconds(2))
+                    return
+                }
+                self.startTask = nil
                 self.channel = channel
+                self.attachedRevision = revision
                 self.status = .running
                 self.pump(channel)
+            } catch {
+                guard self.startToken == token else { return }
+                self.startTask = nil
+                self.status = .ended(
+                    (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                )
+            }
+        }
+    }
+
+    /// Full teardown and a fresh attach on whatever transport the device has
+    /// now. `herdr … attach --takeover` makes re-attaching to the same pane
+    /// legitimate, so this reclaims the pane rather than competing with the
+    /// dead attach still registered on the server.
+    func restart() {
+        stop()
+        start(columns: lastColumns, rows: lastRows)
+    }
+
+    /// Returning to the foreground. Resolving the transport runs the device's
+    /// own probe-or-rebuild first; after that, a channel whose revision no
+    /// longer matches belonged to a session that is gone, so it is re-attached.
+    func resumeAfterForeground() {
+        guard startTask == nil else { return }
+        Task {
+            if case .ended = self.status {
+                self.restart()
+                return
+            }
+            do {
+                _ = try await self.provider.currentTransport()
             } catch {
                 self.status = .ended(
                     (error as? LocalizedError)?.errorDescription ?? "\(error)"
                 )
+                return
+            }
+            let stale = ConnectionRecoveryPolicy.attachNeedsRebuild(
+                attachedRevision: self.attachedRevision,
+                currentRevision: self.provider.transportRevision
+            )
+            if self.channel == nil || stale {
+                self.restart()
             }
         }
     }
@@ -119,10 +186,11 @@ final class MobileAttachSession: ObservableObject {
     /// this client knowing the pane's keyboard protocol state.
     func sendKeys(_ keys: [String]) {
         Task {
+            guard let transport = try? await self.provider.currentTransport() else { return }
             _ = try? await transport.request(
                 method: "pane.send_input",
                 params: .object([
-                    "pane_id": .string(paneID),
+                    "pane_id": .string(self.paneID),
                     "keys": .array(keys.map { .string($0) }),
                 ])
             )
@@ -133,6 +201,7 @@ final class MobileAttachSession: ObservableObject {
     func prompt(_ text: String) {
         guard let agentPaneID else { return }
         Task {
+            guard let transport = try? await self.provider.currentTransport() else { return }
             _ = try? await transport.request(
                 method: "agent.prompt",
                 params: .object([
@@ -160,17 +229,27 @@ final class MobileAttachSession: ObservableObject {
     }
 
     func resize(columns: Int, rows: Int) {
-        guard let channel, columns > 0, rows > 0 else { return }
+        guard columns > 0, rows > 0 else { return }
+        lastColumns = columns
+        lastRows = rows
+        guard let channel else { return }
         Task { try? await channel.resize(columns: columns, rows: rows, timeout: .seconds(5)) }
     }
 
+    /// Drops everything cached on the current SSH session — the read pump, the
+    /// pending start, the channel and the revision it was opened on — so a
+    /// following `start` cannot reuse a dead handle.
     func stop() {
+        startToken += 1
         readTask?.cancel()
         readTask = nil
+        startTask?.cancel()
+        startTask = nil
         if let channel {
             Task { try? await channel.close(timeout: .seconds(2)) }
         }
         channel = nil
+        attachedRevision = nil
     }
 }
 
@@ -178,11 +257,20 @@ struct MobileTerminalScreen: View {
     @StateObject private var session: MobileAttachSession
     @State private var composerText = ""
     @State private var keyboardShown = false
+    @Environment(\.scenePhase) private var scenePhase
     private let title: String
 
-    init(transport: MobileTransport, target: TerminalAttachTarget, paneID: String, title: String) {
+    init(
+        provider: any MobileTransportProvider,
+        target: TerminalAttachTarget,
+        paneID: String,
+        title: String
+    ) {
+        // `StateObject` keeps the first value it is given, so the session must
+        // hold the provider (stable per device) rather than a transport (which
+        // a reconnect replaces underneath this view).
         _session = StateObject(
-            wrappedValue: MobileAttachSession(transport: transport, target: target, paneID: paneID)
+            wrappedValue: MobileAttachSession(provider: provider, target: target, paneID: paneID)
         )
         self.title = title
     }
@@ -203,6 +291,11 @@ struct MobileTerminalScreen: View {
         .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbarBackground(terminalBackground, for: .navigationBar)
         .onDisappear { session.stop() }
+        .onChange(of: scenePhase) { _, phase in
+            // The attach cannot outlive a suspension: re-prove the transport
+            // and re-attach (`--takeover`) when the session behind it is gone.
+            if phase == .active { session.resumeAfterForeground() }
+        }
     }
 
     private var terminalBackground: SwiftUI.Color {
@@ -286,8 +379,7 @@ struct MobileTerminalScreen: View {
                 .font(.callout)
                 .foregroundStyle(.white.opacity(0.8))
             Button(String(localized: "Reconnect")) {
-                session.stop()
-                session.start(columns: 80, rows: 24)
+                session.restart()
             }
             .buttonStyle(.borderedProminent)
         }

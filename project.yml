@@ -30,6 +30,7 @@ targets:
         buildPhase: resources
         excludes:
           - Localizable.xcstrings
+          - AppIcon
       - path: Resources/Localizable.xcstrings
     dependencies:
       - package: HerdrKit
@@ -67,15 +68,15 @@ targets:
         ENABLE_APP_SANDBOX: NO
         COMBINE_HIDPI_IMAGES: YES
         CODE_SIGN_STYLE: Manual
-        DEVELOPMENT_TEAM: NCFNX3LJ83
+        DEVELOPMENT_TEAM: DH5UQL44AR
         LOCALIZATION_PREFERS_STRING_CATALOGS: YES
       configs:
         Debug:
           # real identity so UserNotifications & friends work in dev builds
-          CODE_SIGN_IDENTITY: "Developer ID Application: MOE AI LLC (NCFNX3LJ83)"
+          CODE_SIGN_IDENTITY: "Developer ID Application: RockieStar Inc. (DH5UQL44AR)"
           ONLY_ACTIVE_ARCH: YES
         Release:
-          CODE_SIGN_IDENTITY: "Developer ID Application: MOE AI LLC (NCFNX3LJ83)"
+          CODE_SIGN_IDENTITY: "Developer ID Application: RockieStar Inc. (DH5UQL44AR)"
           ONLY_ACTIVE_ARCH: NO
           ARCHS: "arm64 x86_64"
 
@@ -112,7 +113,7 @@ targets:
           the herdr session running on them.
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.herdrm.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.rockiestar.herdrm.ios
         PRODUCT_NAME: HerdrMobile
         IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -120,7 +121,7 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: NCFNX3LJ83
+        DEVELOPMENT_TEAM: DH5UQL44AR
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         # The bundled libssh2/OpenSSL xcframeworks ship arm64 device + arm64
         # simulator slices only (see Packages/HerdrSSH/Artifacts/PROVENANCE.md).

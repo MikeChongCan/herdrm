@@ -749,8 +749,10 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         guard let hit = lastLinkHit else { return nil }
         let chip = Self.makeSnippetChip(text: hit.displayText, fitting: hit.rect.size)
         let params = UIPreviewParameters()
-        params.backgroundColor = nativeBackgroundColor ?? UIColor(red: 0x10 / 255, green: 0x10 / 255, blue: 0x12 / 255, alpha: 1)
-        params.visiblePath = UIBezierPath(roundedRect: chip.bounds, cornerRadius: 6)
+        // Clear so the system doesn't paint the terminal color over the chip;
+        // the border and lifted fill are what separate it from the blur.
+        params.backgroundColor = .clear
+        params.visiblePath = UIBezierPath(roundedRect: chip.bounds, cornerRadius: 8)
         let target = UIPreviewTarget(container: self, center: CGPoint(x: hit.rect.midX, y: hit.rect.midY))
         return UITargetedPreview(view: chip, parameters: params, target: target)
     }
@@ -758,18 +760,24 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     private static func makeSnippetChip(text: String, fitting size: CGSize) -> UIView {
         let label = UILabel()
         label.text = text
-        label.font = .monospacedSystemFont(ofSize: max(11, size.height * 0.62), weight: .regular)
-        label.textColor = UIColor(red: 0xD6 / 255, green: 0xD6 / 255, blue: 0xD6 / 255, alpha: 1)
+        label.font = .monospacedSystemFont(ofSize: max(12, size.height * 0.62), weight: .medium)
+        label.textColor = .white
         label.lineBreakMode = .byTruncatingMiddle
         label.numberOfLines = 1
         label.textAlignment = .center
-        let width = max(size.width, label.intrinsicContentSize.width + 12)
-        let height = max(size.height, label.intrinsicContentSize.height + 6)
-        label.frame = CGRect(x: 0, y: 0, width: width, height: height)
-        label.layer.cornerRadius = 6
-        label.layer.masksToBounds = true
-        label.backgroundColor = UIColor(red: 0x10 / 255, green: 0x10 / 255, blue: 0x12 / 255, alpha: 1)
-        return label
+        let padX: CGFloat = 10
+        let padY: CGFloat = 6
+        let width = max(size.width + padX * 2, label.intrinsicContentSize.width + padX * 2)
+        let height = max(size.height + padY, label.intrinsicContentSize.height + padY * 2)
+        let chip = UIView(frame: CGRect(x: 0, y: 0, width: width, height: height))
+        chip.backgroundColor = UIColor(white: 0.24, alpha: 1)
+        chip.layer.cornerRadius = 8
+        chip.layer.borderWidth = 1.5
+        chip.layer.borderColor = UIColor.white.withAlphaComponent(0.55).cgColor
+        chip.layer.masksToBounds = true
+        label.frame = chip.bounds.insetBy(dx: padX, dy: padY)
+        chip.addSubview(label)
+        return chip
     }
 
     private static func snippetPreviewController(text: String) -> UIViewController {

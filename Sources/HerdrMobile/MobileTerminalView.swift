@@ -481,15 +481,16 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
 
     private func installLinkMenus() {
         addInteraction(UIEditMenuInteraction(delegate: self))
-        let interaction = UIContextMenuInteraction(delegate: self)
-        addInteraction(interaction)
-        // Wire after both interactions exist so their long-press recognizers
-        // yield to the link menu; pan is not a long-press and stays free.
-        if let menuGR = interaction.gestureRecognizerForFailureRelationship {
-            for case let lp as UILongPressGestureRecognizer in gestureRecognizers ?? []
-            where lp !== menuGR {
-                lp.require(toFail: menuGR)
-            }
+        addInteraction(UIContextMenuInteraction(delegate: self))
+        // UIContextMenuInteraction does not expose its recognizer. After it
+        // attaches, pick the shortest long-press (the system menu, ~0.5s) and
+        // make SwiftTerm's 0.7s Select press wait for it.
+        let longPresses = (gestureRecognizers ?? []).compactMap { $0 as? UILongPressGestureRecognizer }
+        guard let menuPress = longPresses.min(by: { $0.minimumPressDuration < $1.minimumPressDuration }) else {
+            return
+        }
+        for lp in longPresses where lp !== menuPress {
+            lp.require(toFail: menuPress)
         }
     }
 

@@ -1,223 +1,225 @@
 # iOS 终端链接：长按 Context Menu
 
-> 状态：计划（未实现）
-> 范围：`HerdrMobile` 的 Attach 终端。不换终端引擎。
-> 目标：长按 URL 弹出系统 context menu（打开 / 复制 / 分享），换行切开的 URL 也能整段命中。
+> 状态：计划（评审后修订，未实现）
+> 范围：`HerdrMobile` 的 Attach 终端。不换终端引擎，不改 SwiftTerm 源码。
+> 目标：长按 URL 弹出系统 context menu（打开 / 复制 / 分享）。软换行切开的 URL 整段命中。
+
+评审记录见文末。已对照源码接受的约束写进正文，不再保留被否的 API 假设。
 
 ---
 
 ## 1. 要解决什么
 
-现在 iPhone 上几乎选不到链接。
+iPhone 上几乎选不到链接。缺口是 **没有长按菜单**，不是「单击把链接抢走了」。
 
-- SwiftTerm 默认 `linkHighlightMode = .hover`。没有指针悬停，隐式 URL 点不开。
-- `requestOpenLink` 一旦命中就立刻 `UIApplication.shared.open`。和滚动、选区抢手势，也不让人选「复制还是打开」。
-- macOS 已经有选中后右键 Open Link / Copy Link Address。iOS 没有对等物。
+- SwiftTerm 默认 `linkHighlightMode = .hover`。iPhone 没有悬停，`linkForClick` 对隐式 URL 基本不命中；`singleTap` 还要求 `isFirstResponder`（键盘开着）。
+- iPad 有指针时 `.hover` 会高亮，单击仍走 `requestOpenLink` → 立刻 `UIApplication.shared.open`。加 context menu **不会**关掉这条。必须把 delegate 改成空操作，打开只从菜单发生。
+- macOS 已有选中后右键 Open Link / Copy Link Address。iOS 没有对等物。
 
-HerdrMobile 是 display-first（终端只看、composer 打字）。正确交互是 **长按出系统菜单**，不是单击打开。
+HerdrMobile 是 display-first。正确交互是长按出系统菜单。
 
 ---
 
-## 2. 两个问题的结论
+## 2. 换行 URL 与 NSDataDetector
 
-### 2.1 输出里被换行切开的 URL
+### 2.1 换行
 
-能解决。分两种换行，不要混在一起。
-
-| 种类 | 终端里实际发生了什么 | 命中 |
+| 种类 | 实际发生了什么 | 长按能不能整段命中 |
 |---|---|---|
-| **软换行** | 一行写满 `cols`，下一行 `isWrapped = true`。字节流里 URL 是连续的，只是画成两行 | SwiftTerm 已经按 `isWrapped` 链拼回去再跑链接正则。`link(at:)` 返回完整 URL，`rowRanges` 跨多行 |
-| **硬换行** | 输出里真的有 `\n`（agent 自己折行、日志 prettier、markdown） | SwiftTerm 有启发式拼接：上一行尾、下一行头都像 URL 续写，就拼。长按走 `link(at:)` 就能吃到 |
-| **OSC 8** | 显示文字和真正 URL 不是同一段（甚至显示文字中间有换行） | URL 存在 cell payload 里，不依赖可见文字是否被切开。长按命中任意一段即可 |
+| **软换行** | 写满 `cols`，下一行 `isWrapped = true`。PTY 字节里 URL 连续 | 能。`link(at:)` 按 `isWrapped` 链拼完再跑正则 |
+| **硬换行** | 输出里真有 `\n` | **只有上一行画到右缘附近才拼。** `canJoinImplicitRows` 要求 `lastCol >= cols - max(2, cols/5)`。agent 在屏中折断的短 URL，`link(at:)` 给半截。QA 接受半截，不崩溃 |
+| **OSC 8** | 显示文字和 payload URL 不是同一段 | 能。命中任一格子用 payload。**payload 仍要走 http/https 白名单**，SwiftTerm 不做 scheme 检查，`javascript:` / `data:` 会原样返回 |
 
-**不要**拿 `getBufferAsData()` 去扫链接。它每一行后面都插 `\n`，软换行会被拆成两段，`NSDataDetector` 会失败。
+不要用 `getBufferAsData()` 扫链接：每行后面都插 `\n`，软换行被拆。
 
-会话清单如果要从 buffer 收集，必须先按软换行（再加硬换行启发式）拼成逻辑行，再检测。从 PTY 字节流收集更简单：软换行根本不存在于字节里；硬换行才需要拼。
+`displayBuffer`、`Buffer.lines`、`isWrapped` 都是 SwiftTerm **internal**。HerdrMobile / HerdrKit **不能**按行遍历 buffer。长按只调用公开的 `terminal.link(at:)`。清单不走 buffer，走下面的 PTY 剥离器。
 
-长按路径优先 `terminal.link(at:)`，不要自己再写一套折行。
+### 2.2 `NSDataDetector`
 
-做不到、也不做的：URL 中间夹了普通英文句子再续上；那不是链接，是两段字。
+用，只开 `.link`。没有人名类型；人名是 `NLTagger`，终端日志误报太多，不用。
 
-### 2.2 `NSDataDetector` 要不要一起用
+`NSDataDetector` 不跨 `\n`。软换行的拼接已经在 SwiftTerm `link(at:)` 里，我们不在 HerdrKit 再实现一套 wrap join。
 
-要用，但只用 `.link`。不要做人名。
-
-用户记得的「NSString entity detector」是 **`NSDataDetector`**（`NSRegularExpression` 子类）。公开类型只有：
-
-- `.link`
-- `.phoneNumber`
-- `.address`
-- `.date`
-- `.transitInformation`
-
-**没有人名。** 人名是 `NLTagger` 的 `.nameType`（或已弃用的 `NSLinguisticTagger`）。终端日志里 `Darwin`、`main`、`HEAD` 会被当成名字，噪音极大，这个产品不用。
-
-`UITextView.dataDetectorTypes` 只对 `UITextView` 有效。SwiftTerm 是格子 `UIView`，那条路走不通。
-
-怎么配：
-
-| 路径 | 用什么 | 为什么 |
-|---|---|---|
-| 长按 hit-test | 先 `terminal.link(at: .buffer, .explicitAndImplicit)` | 已经处理 OSC 8 + 软/硬换行。我们不要重写 |
-| 长按兜底 | 把按点附近拼好的逻辑行丢给 `NSDataDetector(.link)` | SwiftTerm 正则漏掉的 URL（奇怪 query、IDN）还能捞到 |
-| 会话清单 | 拼好的逻辑行 + `NSDataDetector(.link)`；OSC 8 从 cell payload 另收 | 清单要的是「这段会话里出现过哪些网页」，不需要路径/文件名 |
-| 过滤 | 只保留 `http` / `https` | SwiftTerm 隐式匹配还会给出 `file:`、相对路径、`ssh:`。iOS 上那些不是「打开网页」 |
-
-`NSDataDetector` **不会**跨 `\n` 匹配。调用方必须先拼软换行。这是 API 限制，不是可选项。
-
-macOS 的 `firstURL(in:)` 已经在用 `NSDataDetector(.link)`。iOS 复用同一过滤（scheme 白名单），不要再写一套正则。
+兜底 detector **必须绑在按下的格子上**：对逻辑行跑 detector 之后，只有 range 覆盖按点的那条才算。整行 `firstWebURL` 会在空白字上弹出别人的 URL，并挡住 Select。
 
 ---
 
 ## 3. 交互
 
-### 3.1 长按（主路径）
+### 3.1 长按（主路径，第一版交付）
 
-按在链接上：系统 `UIContextMenuInteraction`。
+按在链接上：`UIContextMenuInteraction`。
 
-- 预览：一行 URL（小 `UIViewController`）。不要抬起整块终端。
-- 动作：
-  - **打开** → `UIApplication.shared.open`
-  - **复制** → 剪贴板
-  - **分享** → `UIActivityViewController`（可选但值得做，iOS 习惯）
-- 按在空白：`configurationForMenuAtLocation` 返回 `nil`。SwiftTerm 原来的 Select / Copy / Paste 气泡还在。
-- 手指一滑：继续现有单指滚动，不出菜单。
+- 预览：一行 URL，不要抬起整块终端。
+- 动作：打开 / 复制 / 分享。
+- 按在空白：返回 `nil`，SwiftTerm 的 Select 气泡还在。
+- 手指一滑：现有单指滚动继续。不要让 pan `require(toFail:)` context menu，否则每次滚动都要等 ~0.5s。
 
-**单击永远不打开链接。**
+`requestOpenLink` 改为空操作。打开只从菜单。
 
-### 3.2 选区（对齐 macOS）
+### 3.2 选区（第二版）
 
-选区文本里 `NSDataDetector` 扫到 `http`/`https` 时，编辑菜单加同样三个动作。双击选中一整段 URL 就能用。换行切开的 URL：若选区只覆盖半截，菜单用选区文字跑 detector；若半截构不成合法 URL，菜单不加链接项——用户应改成长按（会拼完整段）。
+不要往 SwiftTerm 的 `UIMenuController` 里塞 item：`showContextMenu` 非 public，并且每次把 `menuItems` 设成 `[]`；`canPerformAction` 只放行内置 selector。
 
-### 3.3 会话清单（次路径，Heeler Attach Link）
+第二版用 iOS 18 的 `UIEditMenuInteraction`，选区文本经 `firstWebURL` 有 http(s) 再出同样三个动作。半截选区构不成 URL 就没有链接项。
 
-key bar 一个带数字的链接 chip → sheet 列出本次 Attach 里收集到的网页。离开 `MobileTerminalScreen` 清空。滚动、重连保留（session 还活着）。
+### 3.3 会话清单（第二版）
 
-这是长按的备份：URL 已经滚出屏幕、或软换行命中失败时，清单里还有。
-
-不做：始终给所有 URL 加下划线（agent 日志会花掉）。
+key bar 带数字的链接 chip → sheet。`MobileAttachSession` 活着就保留（含重连）；`onDisappear` / `stop` 清空。
 
 ---
 
-## 4. 检测管线
+## 4. 检测管线（长按）
+
+触摸点是视口坐标。滚动手势里的 `row = location.y / rowHeight` 是 **screen row**（0..<rows）。`link(at: .buffer)` 把 row 当绝对 buffer 行，滚过 scrollback 会指错行。
 
 ```
-长按 location
-  → col/row（现有滚动手势已经在算）
-  → terminal.link(at: .buffer(pos), .explicitAndImplicit)
-      ├─ OSC 8 → 用 payload URL（不是显示文字）
-      └─ 隐式（已拼 wrap）→ 用 match.text
-  → 若空：拼按点所在逻辑行，NSDataDetector(.link)
-  → scheme ∈ {http, https} 才出菜单
-  → 否则 nil（把长让给 Select）
+location
+  → col/row 用 cell 尺寸（与现有 pan 相同），这是 screen 坐标
+  → terminal.link(at: .screen(Position(col, row)), .explicitAndImplicit)
+      ├─ OSC 8 payload
+      └─ 隐式 match.text（已拼 isWrapped）
+  → 一律 firstWebURL / http(s) 过滤（含 OSC 8）
+  → 若空：不能对「整行 firstWebURL」交差。只有能把 detector range 映回格子、且包含按点时才兜底
+  → 第一版兜底可省略：SwiftTerm 隐式正则已经覆盖常见 URL；错行打开比漏检更糟
+  → 否则 configuration = nil
 ```
 
-会话收集（PTY 泵字节之后，或新行 dirty 时）：
-
-```
-displayBuffer 按 isWrapped 拼逻辑行
-  + 硬换行启发式（可选，第一版可只做软换行）
-  → 每条逻辑行 NSDataDetector(.link)
-  + 扫描 OSC 8 payload
-  → 去重（URL 字符串）、保序、上限 50
-```
-
-第一版硬换行启发式可以只靠长按的 `link(at:)`，清单只保证软换行 + 字节流里连续的 URL。硬换行清单漏掉可以第二版补；长按命中更重要。
+`getTerminal()`、`link(at:)`、`LinkLookupLocation`、`LinkLookupMode` 都是 public。`calculateTapHit` 不是，不要调用。
 
 ---
 
-## 5. 手势冲突
-
-现在已经有三套：
+## 5. 手势
 
 | 手势 | 谁 | 规则 |
 |---|---|---|
-| 单指 pan | `MobileTerminalUIView` 滚动 | 移动则滚动。context menu 系统自己会在位移后取消 |
-| 0.7s long press | SwiftTerm `UIMenuController` | 空白处 Select |
-| `UIContextMenuInteraction` | 我们加 | 链接上赢；空白返回 nil |
+| 单指 pan | `MobileTerminalUIView` | 保持 `shouldRecognizeSimultaneously = false`。位移则滚动 |
+| 0.7s long press | SwiftTerm `setupGestures`，recognizer **没有存成属性** | 空白 Select |
+| context menu | 我们加 | 链接上赢 |
 
-`shouldRecognizeSimultaneously` 对滚动保持现在的 `false`。context menu 的 recognizer 在命中链接时应让 SwiftTerm long press 失败（`require(toFail:)` 或命中后 `UIMenuController.hideMenu()`）。
+`UIContextMenuInteraction` 没有拿去 `require(toFail:)` 的公开 stored recognizer。用：
 
-iPad 触控板右键走同一 `UIContextMenuInteraction`，不用另写。
+```swift
+let menuGR = interaction.gestureRecognizerForFailureRelationship
+// super.init 已经装上 SwiftTerm long press
+for case let lp as UILongPressGestureRecognizer in gestureRecognizers ?? []
+    where lp !== menuGR {
+    lp.require(toFail: menuGR)
+}
+```
 
-SwiftUI `.contextMenu` 不要用：绑的是整块 `UIViewRepresentable`，命不中格子。
+不要在菜单已经出来之后 `hideMenu()`——太晚，Select 已经开始。
+
+真机必须验：链接长按只有 context menu；空白长按只有 Select；快速滑动能滚。
 
 ---
 
-## 6. 落点
+## 6. 会话收集（第二版，禁止扫 raw PTY、禁止扫 displayBuffer）
 
-纯逻辑（可测，不碰 UI）：
+PTY 块会在任意字节切开，中间夹 CSI / OSC。对 chunk 直接 `NSDataDetector` 会漏检或误检。
+
+在 `MobileAttachSession.feed` 里做 **有状态的剥离器**（纯逻辑放 HerdrKit，可测）：
+
+1. 累积字节，剥 CSI、剥 OSC（含 OSC 8：记下 payload URL）。
+2. 按真实 `\n` 切成可见行（软换行不在字节里，一行里的 URL 是完整的）。
+3. 完整行才跑 `NSDataDetector(.link)` + http(s)。
+4. 半行留在 buffer，等后续字节。
+5. OSC 8 payload 同样过滤后进清单。
+6. URL 字符串去重、保序、上限 50，满了丢掉**最旧**。
+
+硬换行切开的 URL 清单会漏；长按也只有右缘折行才能拼。第一版清单不承诺硬换行。
+
+---
+
+## 7. 落点
 
 - `Packages/HerdrKit/Sources/HerdrKit/TerminalLink.swift`
-  - `firstWebURL(in:)`：`NSDataDetector(.link)` + http/https 过滤（从 macOS `TerminalView.firstURL` 抽出来，macOS / iOS 共用）
-  - 去重、上限、保序的小收集器
+  - `firstWebURL(in:)`：`NSDataDetector(.link)` + `http`/`https`（从 macOS `TerminalView.firstURL` 抽出，Foundation only）
+  - `WebLinkCollector`：去重 / 上限 50 丢最旧
+  - `VisibleTextExtractor`：有状态剥 CSI/OSC，完整行回调（第二版）
+- `Sources/HerdrMobile/MobileTerminalView.swift`
+  - `requestOpenLink` 空操作
+  - `MobileTerminalUIView`：`UIContextMenuInteraction` + failure 关系 + `.screen` hit-test
+- 第二版：`UIEditMenuInteraction`；collector 接到 `feed`；key bar chip + sheet
+- macOS：`firstURL` 改调 HerdrKit
 
-UI：
-
-- `Sources/HerdrMobile/MobileTerminalView.swift` 的 `MobileTerminalUIView`
-  - `UIContextMenuInteraction`
-  - 选区菜单补链接动作
-- `MobileAttachSession`
-  - 收集器生命周期（start/stop/restart 清空或保留：重连保留，`onDisappear` 清空）
-- `MobileTerminalScreen` key bar
-  - 链接 chip + sheet
-
-macOS：把 `firstURL` 改成调 HerdrKit，行为不变。
-
-不改 SwiftTerm 源码。不换 libghostty。
+不改 SwiftTerm。不换 libghostty。
 
 ---
 
-## 7. 测试
+## 8. 测试（HerdrKit，接线前先绿）
 
-HerdrKit 单测（必须先写再接线）：
+1. `https://example.com/path?q=1` → 检出
+2. `http://` 同样
+3. `ftp://`、`file://`、`mailto:`、`javascript:`、`data:`、`/usr/bin/ls`、相对路径 → 丢弃
+4. 去重：同一 URL 两次 → 一条
+5. 上限 50：第 51 条挤掉最旧
+6. 只开 `.link`：电话/地址字符串不进清单
+7. 剥离器：URL 被 CSI 色码切开仍检出
+8. 剥离器：OSC 8 payload `https://…`、显示文字 `docs` → 收集 payload 不是显示文字
+9. 剥离器：chunk 切在 URL 中间 → 等完整行再检出，不产出半截
+10. 剥离器：软换行不存在于输入（无 `\n` 的长 URL）→ 一条
 
-1. 普通 `https://example.com/path?q=1` → 检出
-2. `http` 同样
-3. `ftp://`、`file://`、`mailto:`、`/usr/bin/ls`、相对路径 → 丢弃
-4. 软换行拼合：`"https://github.com/foo/bar/pull/1"` 在 col=20 处切开成两行再拼 → 一条完整 URL
-5. `getBufferAsData` 那种每行 `\n` 的错误输入 → 不断成两条（用拼合函数，不用 raw dump）
-6. OSC 8 显示文字是 `docs`、payload 是 `https://…` → 清单和长按都用 payload
-7. 去重：同一 URL 出现两次 → 一条
-8. 上限 50：第 51 条丢掉或挤掉最旧（选定一种，测那种）
-9. 人名 / 电话 / 地址：`NSDataDetector` 即使匹配也不进清单（只开 `.link`）
-
-UI 无法单测的，QA 手测：见第 9 节。
+不在 HerdrKit 测 SwiftTerm 的 `isWrapped` 拼接（那是引擎内部）。软换行长按靠 QA。
 
 ---
 
-## 8. 不做
+## 9. 不做
 
-- 单击打开
+- 单击打开（含 iPad 指针单击）
 - 人名、电话、地址、日期
-- `file://`、本地路径、`localhost` 自动端口转发
-- 换终端引擎
+- 遍历 `displayBuffer` / `isWrapped`
+- 对 raw PTY chunk 直接 detector
+- 整行 `firstWebURL` 当长按兜底
+- 往 SwiftTerm `UIMenuController` 塞 item
+- `file://`、本地路径、localhost 端口转发
+- 换引擎
 - SwiftUI `.contextMenu` 包整个终端
-- 给所有 URL 常驻下划线
-- 离开详情后持久化链接历史
+- 常驻下划线
+- 离开详情后持久化链接
 
 ---
 
-## 9. QA
+## 10. QA
 
-1. agent 打一行短 `https://…` → 长按 → 打开 / 复制 / 分享都对。
-2. 把终端缩窄，让 GitHub URL 软换行成两行 → 按在第一行或第二行都弹出**完整** URL，打开的不是半截。
-3. 硬换行（agent 在 URL 中间真打了回车）→ 长按尽量拼出完整段；拼不出也不崩溃，空白长按仍是 Select。
-4. OSC 8（显示 `changelog`，实际指向网页）→ 菜单打开的是 payload。
-5. 长按空白 → Select / Copy / Paste，没有 Open Link。
-6. 滚动、composer、key bar 不受影响。
-7. 链接 chip 数字随新 URL 增加；离开屏幕再进 → 清零。
-8. 选中半截 URL → 菜单可以没有链接项；选中整段 → 有。
+1. 短 `https://…` 长按 → 打开 / 复制 / 分享。
+2. 缩窄终端让 GitHub URL 软换行两行 → 按第一行或第二行都是**完整** URL。
+3. 硬换行：右缘折开的尽量完整；屏中折开允许半截或不出菜单，不崩溃。空白长按仍是 Select。
+4. OSC 8 显示 `changelog` → 打开 payload；`javascript:` payload → 不出菜单。
+5. 长按空白 → 只有 Select / Copy / Paste。
+6. 滚动、composer、key bar 不受影响。快速滑动不要被菜单拖住。
+7. iPad 指针：悬停可高亮，**单击不打开**；长按或右键出菜单。
+8. 第二版：chip 数字增加；离开再进清零。选中整段 URL 有链接项，半截没有。
 
 ---
 
-## 10. 实现顺序
+## 11. 实现顺序
 
-1. HerdrKit：`firstWebURL` + 收集器 + 软换行拼合 + 测试。
-2. macOS 改为调用 `firstWebURL`（行为不变，防漂移）。
-3. `MobileTerminalUIView` 挂 `UIContextMenuInteraction`，hit-test 用 `link(at:)` + `firstWebURL`。
-4. 选区菜单补三个动作。
-5. session 收集 + key bar chip + sheet。
-6. 真机走第 9 节。
+1. HerdrKit `firstWebURL` + 过滤测试。
+2. **最小可交付：** `requestOpenLink` 空操作 + context menu + `.screen` hit-test + long-press failure 关系。真机 QA 1–7。
+3. macOS `firstURL` 改调 HerdrKit。
+4. 第二版：剥离器 + collector + chip。
+5. 第二版：`UIEditMenuInteraction` 选区动作。
 
-第 1–4 步就能交付「长按换行 URL → 打开或复制」。清单是加分，不挡主路径。
+第 2 步就是「长按软换行 URL → 打开或复制」。清单和选区菜单不挡。
+
+---
+
+## 12. 评审记录
+
+三路只读评审（acpx Codex、acpx Claude、sol Azure `gpt-5.6-sol`），对照源码后的处理。
+
+| 来源 | 级别 | 结论 | 处理 |
+|---|---|---|---|
+| acpx Codex + Claude | P1/P2 | `require(toFail:)` 没有 stored recognizer；`hideMenu()` 太晚 | **接受。** 改用 `gestureRecognizerForFailureRelationship`，扫描已有 `UILongPressGestureRecognizer` |
+| acpx Codex + Claude | P2 | 触摸 row 是 screen，`.buffer` 会指错 scrollback | **接受。** 改 `.screen` |
+| acpx Codex + Claude | P2 | `displayBuffer` / `lines` / `isWrapped` 非 public | **接受。** 清单不扫 buffer |
+| acpx Codex | P2 | 选区菜单塞不进 SwiftTerm `UIMenuController` | **接受。** 选区改第二版 `UIEditMenuInteraction` |
+| acpx Codex | P2 | 原「1–4 步就能交付」做不到 | **接受。** 最小交付缩到 hit-test + context menu |
+| sol | P2 | 整行 `firstWebURL` 会在非链接格子上弹出菜单 | **接受。** 第一版不做该兜底 |
+| sol | P2 | iPad `.hover` 单击仍 `requestOpenLink` | **接受。** delegate 空操作 |
+| sol | P2 | 禁止对 raw PTY chunk 做 detector | **接受。** 有状态剥离器，完整行才检 |
+| Claude | P3 | 硬换行有右缘阈值，不是「看起来像续写就拼」 | **接受。** §2.1 已改 |
+| Claude | P3 | OSC 8 无 scheme 检查 | **接受。** 全部分支走白名单 |
+| Claude | P3 | 问题陈述夸大了单击抢手势 | **接受。** §1 已改 |
+| — | — | HerdrKit 抽 `firstURL` 无 AppKit 耦合 | 保留。`NSDataDetector` 是 Foundation |

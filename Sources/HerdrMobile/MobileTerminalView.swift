@@ -21,6 +21,7 @@ final class MobileAttachSession: ObservableObject {
     }
 
     @Published var status: Status = .connecting
+    @Published private(set) var collectedLinks: [URL] = []
     /// Resolved on every use rather than held: the device's transport is
     /// replaced wholesale by a reconnect, and this session outlives that.
     let provider: any MobileTransportProvider
@@ -43,6 +44,8 @@ final class MobileAttachSession: ObservableObject {
     private var sawBootstrapMarker = false
     private var bootstrapBuffer = Data()
     weak var terminalView: TerminalView?
+    private var textExtractor = VisibleTextExtractor()
+    private var linkCollector = WebLinkCollector()
 
     /// The herdr pane behind this attach, for key/prompt RPCs.
     let paneID: String
@@ -173,7 +176,24 @@ final class MobileAttachSession: ObservableObject {
     }
 
     private func feed(_ data: Data) {
+        for event in textExtractor.consume(data) {
+            let text: String
+            switch event {
+            case .line(let line): text = line
+            case .osc8(let uri): text = uri
+            }
+            if let url = WebURL.first(in: text) {
+                linkCollector.add(url)
+            }
+        }
+        collectedLinks = linkCollector.urls
         terminalView?.feed(byteArray: ArraySlice([UInt8](data)))
+    }
+
+    func discardCollectedLinks() {
+        textExtractor = VisibleTextExtractor()
+        linkCollector = WebLinkCollector()
+        collectedLinks = []
     }
 
     func send(_ bytes: ArraySlice<UInt8>) {
@@ -257,6 +277,7 @@ struct MobileTerminalScreen: View {
     @StateObject private var session: MobileAttachSession
     @State private var composerText = ""
     @State private var keyboardShown = false
+    @State private var showingLinks = false
     @Environment(\.scenePhase) private var scenePhase
     private let title: String
 
@@ -290,7 +311,13 @@ struct MobileTerminalScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbarBackground(terminalBackground, for: .navigationBar)
-        .onDisappear { session.stop() }
+        .onDisappear {
+            session.stop()
+            session.discardCollectedLinks()
+        }
+        .sheet(isPresented: $showingLinks) {
+            collectedLinksSheet
+        }
         .onChange(of: scenePhase) { _, phase in
             // The attach cannot outlive a suspension: re-prove the transport
             // and re-attach (`--takeover`) when the session behind it is gone.
@@ -318,6 +345,19 @@ struct MobileTerminalScreen: View {
     private var keyBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if !session.collectedLinks.isEmpty {
+                    Button {
+                        showingLinks = true
+                    } label: {
+                        Text(linkChipLabel)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .frame(minWidth: 34)
+                            .frame(height: 30)
+                            .padding(.horizontal, 4)
+                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                }
                 KeyChip("esc") { session.sendKeys(["esc"]) }
                 KeyChip("tab") { session.sendKeys(["tab"]) }
                 KeyChip("↑") { session.sendKeys(["up"]) }
@@ -333,6 +373,38 @@ struct MobileTerminalScreen: View {
                         .foregroundStyle(.white.opacity(0.75))
                         .frame(width: 34, height: 30)
                         .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+        }
+    }
+
+    private var linkChipLabel: String {
+        let count = session.collectedLinks.count
+        if count == 1 { return String(localized: "link") }
+        return String(localized: "link · \(count)")
+    }
+
+    private var collectedLinksSheet: some View {
+        NavigationStack {
+            List(session.collectedLinks, id: \.absoluteString) { url in
+                Button(url.absoluteString) {
+                    UIApplication.shared.open(url)
+                }
+                .swipeActions(edge: .trailing) {
+                    Button(String(localized: "Copy")) {
+                        UIPasteboard.general.string = url.absoluteString
+                    }
+                }
+                .contextMenu {
+                    Button(String(localized: "Copy")) {
+                        UIPasteboard.general.string = url.absoluteString
+                    }
+                }
+            }
+            .navigationTitle(String(localized: "Links"))
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(String(localized: "Done")) { showingLinks = false }
                 }
             }
         }
@@ -391,18 +463,114 @@ struct MobileTerminalScreen: View {
 /// TerminalView subclass for iOS that translates single- and two-finger touch dragging
 /// into terminal scrolling (SGR mouse wheel for mouse-tracking sessions like herdr / tmux /
 /// agents, cursor arrow keys for alternate screen buffers, and local scrollback for normal buffers).
-final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate {
+final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
     private var scrollPanGesture: UIPanGestureRecognizer?
     private var accumulatedScrollDelta: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupTouchScrolling()
+        installLinkMenus()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupTouchScrolling()
+        installLinkMenus()
+    }
+
+    private func installLinkMenus() {
+        let interaction = UIContextMenuInteraction(delegate: self)
+        addInteraction(interaction)
+        if let menuGR = interaction.gestureRecognizerForFailureRelationship {
+            for case let lp as UILongPressGestureRecognizer in gestureRecognizers ?? []
+            where lp !== menuGR {
+                lp.require(toFail: menuGR)
+            }
+        }
+        addInteraction(UIEditMenuInteraction(delegate: self))
+    }
+
+    func webURL(at location: CGPoint) -> URL? {
+        let terminal = getTerminal()
+        let cols = max(1, terminal.cols)
+        let rows = max(1, terminal.rows)
+        let col = max(0, min(cols - 1, Int(location.x / max(1, bounds.width / CGFloat(cols)))))
+        let row = max(0, min(rows - 1, Int(location.y / max(1, bounds.height / CGFloat(rows)))))
+        guard let raw = terminal.link(
+            at: .screen(Position(col: col, row: row)),
+            mode: .explicitAndImplicit
+        ) else { return nil }
+        return WebURL.first(in: raw)
+    }
+
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configurationForMenuAtLocation location: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let url = webURL(at: location) else { return nil }
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: {
+            let label = UILabel()
+            label.text = url.absoluteString
+            label.font = .preferredFont(forTextStyle: .body)
+            label.numberOfLines = 1
+            label.lineBreakMode = .byTruncatingMiddle
+            label.textAlignment = .center
+            let vc = UIViewController()
+            vc.view = label
+            vc.preferredContentSize = CGSize(width: 280, height: 44)
+            return vc
+        }, actionProvider: { [weak self] _ in
+            self?.linkMenu(for: url)
+        })
+    }
+
+    func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction,
+        menuFor configuration: UIEditMenuConfiguration,
+        suggestedActions: [UIMenuElement]
+    ) -> UIMenu? {
+        var actions = suggestedActions
+        if selection.active, let url = WebURL.first(in: selection.getSelectedText()) {
+            actions.append(contentsOf: linkMenu(for: url).children)
+        }
+        return UIMenu(children: actions)
+    }
+
+    private func linkMenu(for url: URL) -> UIMenu {
+        let open = UIAction(title: String(localized: "Open"), image: UIImage(systemName: "safari")) { _ in
+            UIApplication.shared.open(url)
+        }
+        let copy = UIAction(title: String(localized: "Copy"), image: UIImage(systemName: "doc.on.doc")) { _ in
+            UIPasteboard.general.string = url.absoluteString
+        }
+        var children: [UIMenuElement] = [open, copy]
+        if nearestViewController() != nil {
+            let share = UIAction(title: String(localized: "Share"), image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
+                self?.share(url)
+            }
+            children.append(share)
+        }
+        return UIMenu(children: children)
+    }
+
+    private func share(_ url: URL) {
+        guard let presenter = nearestViewController() else { return }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = activity.popoverPresentationController {
+            popover.sourceView = self
+            popover.sourceRect = CGRect(x: bounds.midX, y: bounds.midY, width: 1, height: 1)
+        }
+        presenter.present(activity, animated: true)
+    }
+
+    private func nearestViewController() -> UIViewController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let vc = current as? UIViewController { return vc }
+            responder = current.next
+        }
+        return window?.rootViewController
     }
 
     private func setupTouchScrolling() {
@@ -620,10 +788,7 @@ private struct MobileTerminalHost: UIViewRepresentable {
             Task { @MainActor in self.session.send(bytes[...]) }
         }
         nonisolated func scrolled(source: TerminalView, position: Double) {}
-        nonisolated func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
-            guard let url = URL(string: link), url.scheme == "http" || url.scheme == "https" else { return }
-            Task { @MainActor in UIApplication.shared.open(url) }
-        }
+        nonisolated func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
         nonisolated func bell(source: TerminalView) {}
         nonisolated func clipboardCopy(source: TerminalView, content: Data) {
             if let text = String(data: content, encoding: .utf8) {

@@ -270,13 +270,7 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
     }
 
     static func firstURL(in text: String) -> URL? {
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-        let range = NSRange(text.startIndex..., in: text)
-        guard let match = detector?.firstMatch(in: text, range: range),
-              let url = match.url,
-              url.scheme == "http" || url.scheme == "https"
-        else { return nil }
-        return url
+        WebURL.first(in: text)
     }
 
     override func interpretKeyEvents(_ eventArray: [NSEvent]) {

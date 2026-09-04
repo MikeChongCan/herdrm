@@ -5,6 +5,13 @@ on [Keep a Changelog](https://keepachangelog.com); versions follow semver.
 Release automation extracts the matching section for GitHub release notes and
 the Sparkle update description — a release without a section here fails CI.
 
+## [Unreleased]
+
+### Added
+- iOS: long-press a terminal URL for the system context menu (Open / Copy / Share).
+  Soft-wrapped links resolve as one URL. Attach sessions also collect http(s) links
+  into a key-bar list. Taps no longer open links.
+
 ## [0.5.3] - 2026-08-29
 
 ### Added

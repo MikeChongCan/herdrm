@@ -52,6 +52,7 @@ public struct VisibleTextExtractor {
     private var visible = Data()
     private var oscBody = Data()
     private var pendingCR = false
+    private var skipNextVisible = false
 
     public init() {}
 
@@ -84,7 +85,11 @@ public struct VisibleTextExtractor {
             case 0x00...0x1F, 0x7F:
                 break
             default:
-                visible.append(byte)
+                if skipNextVisible {
+                    skipNextVisible = false
+                } else {
+                    visible.append(byte)
+                }
             }
         case .escape:
             switch byte {
@@ -95,6 +100,7 @@ public struct VisibleTextExtractor {
                 oscBody.removeAll()
             default:
                 mode = .ground
+                skipNextVisible = true
             }
         case .csi:
             if byte >= 0x40, byte <= 0x7E {

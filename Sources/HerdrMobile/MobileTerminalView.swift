@@ -480,15 +480,17 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     }
 
     private func installLinkMenus() {
+        addInteraction(UIEditMenuInteraction(delegate: self))
         let interaction = UIContextMenuInteraction(delegate: self)
         addInteraction(interaction)
+        // Wire after both interactions exist so their long-press recognizers
+        // yield to the link menu; pan is not a long-press and stays free.
         if let menuGR = interaction.gestureRecognizerForFailureRelationship {
             for case let lp as UILongPressGestureRecognizer in gestureRecognizers ?? []
             where lp !== menuGR {
                 lp.require(toFail: menuGR)
             }
         }
-        addInteraction(UIEditMenuInteraction(delegate: self))
     }
 
     func webURL(at location: CGPoint) -> URL? {

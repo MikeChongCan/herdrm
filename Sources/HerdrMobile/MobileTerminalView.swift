@@ -539,9 +539,16 @@ struct MobileTerminalScreen: View {
 /// into terminal scrolling (SGR mouse wheel for mouse-tracking sessions like herdr / tmux /
 /// agents, cursor arrow keys for alternate screen buffers, and local scrollback for normal buffers).
 final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
+    private struct LinkHit {
+        let link: DetectedLink
+        let displayText: String
+        let rect: CGRect
+    }
+
     private var scrollPanGesture: UIPanGestureRecognizer?
     private var accumulatedScrollDelta: CGFloat = 0
     weak var attachSession: MobileAttachSession?
+    private var lastLinkHit: LinkHit?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -570,22 +577,48 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         }
     }
 
-    func detectedLink(at location: CGPoint) -> DetectedLink? {
-        let terminal = getTerminal()
-        let cols = max(1, terminal.cols)
-        let rows = max(1, terminal.rows)
-        let col = max(0, min(cols - 1, Int(location.x / max(1, bounds.width / CGFloat(cols)))))
-        let row = max(0, min(rows - 1, Int(location.y / max(1, bounds.height / CGFloat(rows)))))
-        if let raw = terminal.link(
-            at: .screen(Position(col: col, row: row)),
-            mode: .explicitAndImplicit
-        ), let link = parseLink(raw) {
-            return link
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configurationForMenuAtLocation location: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let hit = linkHit(at: location) else {
+            lastLinkHit = nil
+            return nil
         }
-        if selection.active {
-            return parseLink(selection.getSelectedText())
+        lastLinkHit = hit
+        let link = hit.link
+        let display = hit.displayText
+        return UIContextMenuConfiguration(identifier: display as NSString, previewProvider: {
+            Self.snippetPreviewController(text: display)
+        }, actionProvider: { [weak self] _ in
+            self?.menu(for: link)
+        })
+    }
+
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configuration: UIContextMenuConfiguration,
+        highlightPreviewForItemWithIdentifier identifier: any NSCopying
+    ) -> UITargetedPreview? {
+        snippetTargetedPreview()
+    }
+
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configuration: UIContextMenuConfiguration,
+        dismissalPreviewForItemWithIdentifier identifier: any NSCopying
+    ) -> UITargetedPreview? {
+        snippetTargetedPreview()
+    }
+
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        willEndFor configuration: UIContextMenuConfiguration,
+        animator: UIContextMenuInteractionAnimating?
+    ) {
+        animator?.addCompletion { [weak self] in
+            self?.lastLinkHit = nil
         }
-        return nil
     }
 
     private func parseLink(_ raw: String) -> DetectedLink? {
@@ -596,30 +629,155 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         )
     }
 
-    func contextMenuInteraction(
-        _ interaction: UIContextMenuInteraction,
-        configurationForMenuAtLocation location: CGPoint
-    ) -> UIContextMenuConfiguration? {
-        guard let link = detectedLink(at: location) else { return nil }
-        return UIContextMenuConfiguration(identifier: nil, previewProvider: {
-            let label = UILabel()
-            switch link {
-            case .web(let url):
-                label.text = url.absoluteString
-            case .hostFile(let path):
-                label.text = path
+    private func linkHit(at location: CGPoint) -> LinkHit? {
+        let terminal = getTerminal()
+        let cols = max(1, terminal.cols)
+        let rows = max(1, terminal.rows)
+        let cellW = max(1, bounds.width / CGFloat(cols))
+        let cellH = max(1, bounds.height / CGFloat(rows))
+        let col = max(0, min(cols - 1, Int(location.x / cellW)))
+        let row = max(0, min(rows - 1, Int(location.y / cellH)))
+
+        if let raw = terminal.link(
+            at: .screen(Position(col: col, row: row)),
+            mode: .explicitAndImplicit
+        ), let link = parseLink(raw) {
+            let display = onScreenToken(raw: raw, screenRow: row, tapCol: col, cols: cols, terminal: terminal)
+            let span = columnSpan(of: display, inScreenRow: row, tapCol: col, cols: cols, terminal: terminal)
+            return LinkHit(link: link, displayText: display, rect: cellRect(startCol: span.start, endCol: span.end, row: row, cellW: cellW, cellH: cellH))
+        }
+        if selection.active, let link = parseLink(selection.getSelectedText()) {
+            let display = selection.getSelectedText().trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !display.isEmpty else { return nil }
+            let yDisp = terminal.buffer.yDisp
+            let startRow = selection.start.row - yDisp
+            let endRow = selection.end.row - yDisp
+            if startRow == row || endRow == row || (startRow...endRow).contains(row) {
+                let startCol = startRow == row ? selection.start.col : 0
+                let endCol = endRow == row ? selection.end.col + 1 : cols
+                return LinkHit(
+                    link: link,
+                    displayText: display,
+                    rect: cellRect(startCol: startCol, endCol: endCol, row: row, cellW: cellW, cellH: cellH)
+                )
             }
-            label.font = .preferredFont(forTextStyle: .body)
-            label.numberOfLines = 1
-            label.lineBreakMode = .byTruncatingMiddle
-            label.textAlignment = .center
-            let vc = UIViewController()
-            vc.view = label
-            vc.preferredContentSize = CGSize(width: 280, height: 44)
-            return vc
-        }, actionProvider: { [weak self] _ in
-            self?.menu(for: link)
-        })
+            let span = columnSpan(of: display, inScreenRow: row, tapCol: col, cols: cols, terminal: terminal)
+            return LinkHit(link: link, displayText: display, rect: cellRect(startCol: span.start, endCol: span.end, row: row, cellW: cellW, cellH: cellH))
+        }
+        return nil
+    }
+
+    private func screenLine(row: Int, cols: Int, terminal: Terminal) -> String {
+        let y = terminal.buffer.yDisp + row
+        return terminal.getText(
+            start: Position(col: 0, row: y),
+            end: Position(col: max(0, cols - 1), row: y)
+        ).trimmingCharacters(in: CharacterSet(charactersIn: "\n\r"))
+    }
+
+    /// Text actually visible at the press, not the resolved absolute path.
+    private func onScreenToken(raw: String, screenRow: Int, tapCol: Int, cols: Int, terminal: Terminal) -> String {
+        let line = screenLine(row: screenRow, cols: cols, terminal: terminal)
+        if line.contains(raw) { return raw }
+        let base = (raw as NSString).lastPathComponent
+        if !base.isEmpty, line.contains(base) { return base }
+        return tokenAt(column: tapCol, in: line) ?? base
+    }
+
+    private func columnSpan(of token: String, inScreenRow row: Int, tapCol: Int, cols: Int, terminal: Terminal) -> (start: Int, end: Int) {
+        let line = screenLine(row: row, cols: cols, terminal: terminal)
+        let ns = line as NSString
+        let tap = min(max(0, tapCol), max(0, ns.length - 1))
+        var found = NSRange(location: NSNotFound, length: 0)
+        if !token.isEmpty {
+            var search = NSRange(location: 0, length: ns.length)
+            while true {
+                let r = ns.range(of: token, options: [], range: search)
+                if r.location == NSNotFound { break }
+                if NSLocationInRange(tap, r) || abs(Int(r.location) - tapCol) < abs(Int(found.location == NSNotFound ? Int.max : found.location) - tapCol) {
+                    found = r
+                    if NSLocationInRange(tap, r) { break }
+                }
+                let next = r.location + max(1, r.length)
+                if next >= ns.length { break }
+                search = NSRange(location: next, length: ns.length - next)
+            }
+        }
+        if found.location != NSNotFound {
+            let start = max(0, found.location)
+            let end = min(cols, found.location + found.length)
+            if start < end { return (start, end) }
+        }
+        let width = min(cols, max(1, (token as NSString).length))
+        let start = max(0, min(tapCol, cols - width))
+        return (start, start + width)
+    }
+
+    private func tokenAt(column: Int, in line: String) -> String? {
+        let ns = line as NSString
+        guard ns.length > 0 else { return nil }
+        let i = min(max(0, column), ns.length - 1)
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-+/@~"))
+        var start = i
+        var end = i
+        while start > 0 {
+            let ch = ns.character(at: start - 1)
+            guard let scalar = UnicodeScalar(ch), allowed.contains(scalar) else { break }
+            start -= 1
+        }
+        while end < ns.length {
+            let ch = ns.character(at: end)
+            guard let scalar = UnicodeScalar(ch), allowed.contains(scalar) else { break }
+            end += 1
+        }
+        guard start < end else { return nil }
+        return ns.substring(with: NSRange(location: start, length: end - start))
+    }
+
+    private func cellRect(startCol: Int, endCol: Int, row: Int, cellW: CGFloat, cellH: CGFloat) -> CGRect {
+        let start = max(0, startCol)
+        let end = max(start + 1, endCol)
+        return CGRect(
+            x: CGFloat(start) * cellW,
+            y: CGFloat(row) * cellH,
+            width: CGFloat(end - start) * cellW,
+            height: cellH
+        ).insetBy(dx: -2, dy: -1)
+    }
+
+    private func snippetTargetedPreview() -> UITargetedPreview? {
+        guard let hit = lastLinkHit else { return nil }
+        let chip = Self.makeSnippetChip(text: hit.displayText, fitting: hit.rect.size)
+        let params = UIPreviewParameters()
+        params.backgroundColor = nativeBackgroundColor ?? UIColor(red: 0x10 / 255, green: 0x10 / 255, blue: 0x12 / 255, alpha: 1)
+        params.visiblePath = UIBezierPath(roundedRect: chip.bounds, cornerRadius: 6)
+        let target = UIPreviewTarget(container: self, center: CGPoint(x: hit.rect.midX, y: hit.rect.midY))
+        return UITargetedPreview(view: chip, parameters: params, target: target)
+    }
+
+    private static func makeSnippetChip(text: String, fitting size: CGSize) -> UIView {
+        let label = UILabel()
+        label.text = text
+        label.font = .monospacedSystemFont(ofSize: max(11, size.height * 0.62), weight: .regular)
+        label.textColor = UIColor(red: 0xD6 / 255, green: 0xD6 / 255, blue: 0xD6 / 255, alpha: 1)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.numberOfLines = 1
+        label.textAlignment = .center
+        let width = max(size.width, label.intrinsicContentSize.width + 12)
+        let height = max(size.height, label.intrinsicContentSize.height + 6)
+        label.frame = CGRect(x: 0, y: 0, width: width, height: height)
+        label.layer.cornerRadius = 6
+        label.layer.masksToBounds = true
+        label.backgroundColor = UIColor(red: 0x10 / 255, green: 0x10 / 255, blue: 0x12 / 255, alpha: 1)
+        return label
+    }
+
+    private static func snippetPreviewController(text: String) -> UIViewController {
+        let chip = makeSnippetChip(text: text, fitting: CGSize(width: 120, height: 28))
+        let vc = UIViewController()
+        vc.view = chip
+        vc.preferredContentSize = chip.bounds.size
+        return vc
     }
 
     func editMenuInteraction(

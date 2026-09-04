@@ -58,6 +58,18 @@ public final class SSHSFTPClient: Sendable {
             timeout: timeout)
     }
 
+    public func readFileIfPresent(
+        at path: String,
+        maxBytes: Int,
+        timeout: Duration
+    ) async throws -> Data? {
+        try await driver.readSFTPFileIfPresent(
+            id: id,
+            path: path,
+            maxBytes: maxBytes,
+            timeout: timeout)
+    }
+
     public func openFileForWriting(
         at path: String,
         permissions: UInt32,

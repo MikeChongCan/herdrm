@@ -1,5 +1,77 @@
 import Foundation
 
+public enum DetectedLink: Equatable {
+    case web(URL)
+    case hostFile(String)
+}
+
+public enum HostFilePath {
+    public static func parse(raw: String, cwd: String?, home: String?) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains(where: \.isWhitespace) { return nil }
+        if trimmed.contains("\\") { return nil }
+        if trimmed.range(of: #"^[A-Za-z]:[\\/]"#, options: .regularExpression) != nil {
+            return nil
+        }
+
+        let expanded: String
+        if trimmed == "~" || trimmed.hasPrefix("~/") {
+            guard let home, home.hasPrefix("/") else { return nil }
+            expanded = trimmed == "~" ? home : home + String(trimmed.dropFirst())
+        } else if trimmed.hasPrefix("/") {
+            expanded = trimmed
+        } else {
+            guard let cwd, cwd.hasPrefix("/") else { return nil }
+            expanded = (cwd as NSString).appendingPathComponent(trimmed)
+        }
+
+        let standardized = (expanded as NSString).standardizingPath
+        guard standardized.hasPrefix("/") else { return nil }
+        return standardized
+    }
+}
+
+extension DetectedLink {
+    public static func parse(_ raw: String, cwd: String?, home: String?) -> DetectedLink? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let url = WebURL.first(in: trimmed) {
+            return .web(url)
+        }
+        if let url = Self.urlWithScheme(trimmed) {
+            let scheme = url.scheme?.lowercased() ?? ""
+            if scheme == "file" {
+                let host = url.host ?? ""
+                if !host.isEmpty, host.caseInsensitiveCompare("localhost") != .orderedSame {
+                    return nil
+                }
+                guard let path = HostFilePath.parse(raw: url.path, cwd: cwd, home: home) else {
+                    return nil
+                }
+                return .hostFile(path)
+            }
+            return nil
+        }
+        guard let path = HostFilePath.parse(raw: trimmed, cwd: cwd, home: home) else {
+            return nil
+        }
+        return .hostFile(path)
+    }
+
+    private static func urlWithScheme(_ raw: String) -> URL? {
+        let candidates = [
+            URL(string: raw),
+            raw.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed)
+                .flatMap(URL.init(string:)),
+        ]
+        return candidates.compactMap { $0 }.first { url in
+            guard let scheme = url.scheme, !scheme.isEmpty else { return false }
+            return true
+        }
+    }
+}
+
 public enum WebURL {
     /// First http/https URL in `text` via NSDataDetector(.link).
     public static func first(in text: String) -> URL? {

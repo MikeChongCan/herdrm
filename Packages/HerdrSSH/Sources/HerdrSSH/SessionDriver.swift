@@ -884,11 +884,11 @@ actor SessionDriver {
         try checkSFTPResult(result, sftp: sftp, session: session)
         let hasSize = attributes.flags & UInt(LIBSSH2_SFTP_ATTR_SIZE) != 0
         let hasPermissions = attributes.flags & UInt(LIBSSH2_SFTP_ATTR_PERMISSIONS) != 0
+        let mode = UInt32(truncatingIfNeeded: attributes.permissions)
         return SSHSFTPAttributes(
             size: hasSize ? attributes.filesize : nil,
-            permissions: hasPermissions
-                ? UInt32(truncatingIfNeeded: attributes.permissions) & 0o777
-                : nil)
+            permissions: hasPermissions ? mode & 0o777 : nil,
+            isDirectory: hasPermissions && (mode & 0o170000) == 0o040000)
     }
 
     func setSFTPPermissions(
@@ -926,6 +926,7 @@ actor SessionDriver {
     func readSFTPFileIfPresent(
         id: UInt64,
         path: String,
+        maxBytes: Int? = nil,
         timeout: Duration
     ) async throws -> Data? {
         guard Self.isValidSFTPPath(path) else { throw SSHError.channelFailed }
@@ -944,6 +945,9 @@ actor SessionDriver {
                 deadline: deadline)
             {
                 contents.append(chunk)
+                if let maxBytes, contents.count > maxBytes {
+                    throw SSHError.responseTooLarge(limit: maxBytes)
+                }
             }
             try await closeSFTPFile(
                 sftpID: id,

@@ -11,6 +11,7 @@ the Sparkle update description — a release without a section here fails CI.
 - iOS: long-press a terminal URL for the system context menu (Open / Copy / Share).
   Soft-wrapped links resolve as one URL. Attach sessions also collect http(s) links
   into a key-bar list. Taps no longer open links.
+- iOS: long-press on terminal file paths / file:// opens a read-only Quick Look snapshot over SFTP.
 
 ## [0.5.3] - 2026-08-29
 

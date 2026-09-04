@@ -17,6 +17,7 @@ struct MobileRootView: View {
                let session = model.selectedSession {
                 MobileTerminalScreen(
                     provider: session,
+                    cwdProvider: { session.currentCwd(for: agent.paneID) },
                     target: .agent(paneID: agent.paneID),
                     paneID: agent.paneID,
                     title: agent.title(tabLabel: model.tabLabel(for: agent))
@@ -27,6 +28,7 @@ struct MobileRootView: View {
                       let session = model.selectedSession {
                 MobileTerminalScreen(
                     provider: session,
+                    cwdProvider: { session.currentCwd(for: pane.paneID) },
                     target: .terminal(terminalID: terminalID),
                     paneID: pane.paneID,
                     title: model.terminalLabel(for: pane)

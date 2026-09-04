@@ -197,6 +197,25 @@ extension MobileDeviceSession: MobileTransportProvider {
         }
         return transport
     }
+
+    var remoteHome: String {
+        transport?.remoteHome ?? ""
+    }
+
+    func currentCwd(for paneID: String) -> String? {
+        guard let snapshot else { return nil }
+        if let cwd = snapshot.agents.first(where: { $0.paneID == paneID })?.cwd,
+           !cwd.isEmpty
+        {
+            return cwd
+        }
+        if let cwd = snapshot.panes?.first(where: { $0.paneID == paneID })?.cwd,
+           !cwd.isEmpty
+        {
+            return cwd
+        }
+        return nil
+    }
 }
 
 @MainActor

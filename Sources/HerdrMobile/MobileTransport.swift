@@ -7,9 +7,11 @@ import HerdrSSH
 /// `direct-streamlocal` channel per RPC (herdr is one-request-per-connection).
 /// A relay transport slots in behind the same face later.
 protocol MobileTransport: Sendable {
+    var remoteHome: String { get }
     func request(method: String, params: JSONValue) async throws -> JSONValue
     func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
     func openTerminal(command: String, columns: Int, rows: Int) async throws -> SSHPTYChannel
+    func openSFTP(timeout: Duration) async throws -> SSHSFTPClient
     /// Whether this transport can still carry an RPC. iOS suspension can leave
     /// libssh2 believing it is connected while the socket underneath is dead,
     /// so this must prove liveness on the wire rather than read a flag.
@@ -32,6 +34,9 @@ protocol MobileTransportProvider: AnyObject {
     /// The transport to use now, reconnecting first when the held one is gone
     /// or cannot prove itself.
     func currentTransport() async throws -> MobileTransport
+
+    var remoteHome: String { get }
+    func currentCwd(for paneID: String) -> String?
 }
 
 extension MobileTransport {
@@ -76,6 +81,7 @@ enum MobileTransportError: LocalizedError {
 /// streamlocal channel (herdr closes the socket after one reply); the event
 /// subscription holds a long-lived channel and streams NDJSON lines.
 final class SSHDirectTransport: MobileTransport {
+    let remoteHome: String
     private let connection: SSHConnection
     private let socketPath: String
 
@@ -85,9 +91,10 @@ final class SSHDirectTransport: MobileTransport {
     /// dead quickly so the rebuild can start.
     private static let probeTimeout: Duration = .seconds(4)
 
-    private init(connection: SSHConnection, socketPath: String) {
+    private init(connection: SSHConnection, socketPath: String, remoteHome: String) {
         self.connection = connection
         self.socketPath = socketPath
+        self.remoteHome = remoteHome
     }
 
     /// Connects, verifies the pinned host key (TOFU on first contact),
@@ -136,20 +143,23 @@ final class SSHDirectTransport: MobileTransport {
                 )
             }
 
+            // sshd exec is not a login shell, but $HOME is always set.
+            // Socket override does not skip this: ~ expansion needs home.
+            let result = try await connection.execute(
+                "printf '%s' \"$HOME\"", timeout: .seconds(10)
+            )
+            guard let home = String(data: result.stdout, encoding: .utf8),
+                  home.hasPrefix("/")
+            else { throw MobileTransportError.homeProbeFailed }
             let socketPath: String
             if let override = device.socketPath, !override.isEmpty {
                 socketPath = override
             } else {
-                // sshd exec is not a login shell, but $HOME is always set.
-                let result = try await connection.execute(
-                    "printf '%s' \"$HOME\"", timeout: .seconds(10)
-                )
-                guard let home = String(data: result.stdout, encoding: .utf8),
-                      home.hasPrefix("/")
-                else { throw MobileTransportError.homeProbeFailed }
                 socketPath = home + "/.config/herdr/herdr.sock"
             }
-            return SSHDirectTransport(connection: connection, socketPath: socketPath)
+            return SSHDirectTransport(
+                connection: connection, socketPath: socketPath, remoteHome: home
+            )
         } catch {
             try? await connection.close(timeout: .seconds(2))
             throw error
@@ -263,6 +273,10 @@ final class SSHDirectTransport: MobileTransport {
             rows: rows,
             timeout: .seconds(15)
         )
+    }
+
+    func openSFTP(timeout: Duration) async throws -> SSHSFTPClient {
+        try await connection.openSFTP(timeout: timeout)
     }
 
     func close() async {

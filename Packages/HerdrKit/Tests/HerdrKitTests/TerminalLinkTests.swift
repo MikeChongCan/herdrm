@@ -92,4 +92,53 @@ final class TerminalLinkTests: XCTestCase {
         XCTAssertTrue(extractor.consume(Data(long.utf8)).isEmpty)
         XCTAssertEqual(extractor.consume(Data("\n".utf8)), [.line(long)])
     }
+
+    func testDetectedLinkFileURL() {
+        XCTAssertEqual(
+            DetectedLink.parse("file:///Users/me/README.md", cwd: nil, home: nil),
+            .hostFile("/Users/me/README.md")
+        )
+        XCTAssertEqual(
+            DetectedLink.parse("file://localhost/Users/me/a.md", cwd: nil, home: nil),
+            .hostFile("/Users/me/a.md")
+        )
+        XCTAssertNil(DetectedLink.parse("file://other/Users/me/a.md", cwd: nil, home: nil))
+    }
+
+    func testDetectedLinkRelativeAndHome() {
+        XCTAssertEqual(
+            DetectedLink.parse("./docs/a.md", cwd: "/proj", home: nil),
+            .hostFile("/proj/docs/a.md")
+        )
+        XCTAssertEqual(
+            DetectedLink.parse("~/foo.md", cwd: nil, home: "/Users/me"),
+            .hostFile("/Users/me/foo.md")
+        )
+    }
+
+    func testDetectedLinkWebAndRejectedSchemes() {
+        XCTAssertEqual(
+            DetectedLink.parse("https://x.com", cwd: nil, home: nil),
+            .web(URL(string: "https://x.com")!)
+        )
+        for raw in ["javascript:alert(1)", "ssh:host", "git://example.com/repo", #"C:\Windows\a.md"#] {
+            XCTAssertNil(DetectedLink.parse(raw, cwd: "/proj", home: "/Users/me"), raw)
+        }
+    }
+
+    func testDetectedLinkBareNameNeedsCwd() {
+        XCTAssertEqual(
+            DetectedLink.parse("foo.md", cwd: "/proj", home: nil),
+            .hostFile("/proj/foo.md")
+        )
+        XCTAssertNil(DetectedLink.parse("foo.md", cwd: nil, home: nil))
+    }
+
+    func testDetectedLinkTrimsAndRejectsInternalWhitespace() {
+        XCTAssertEqual(
+            DetectedLink.parse(" /tmp/a.md ", cwd: nil, home: nil),
+            .hostFile("/tmp/a.md")
+        )
+        XCTAssertNil(DetectedLink.parse("/tmp/a file.md", cwd: nil, home: nil))
+    }
 }

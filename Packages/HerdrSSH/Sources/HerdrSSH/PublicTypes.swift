@@ -60,4 +60,5 @@ public enum SSHError: Error, Sendable, Equatable {
 public struct SSHSFTPAttributes: Sendable, Equatable {
     public let size: UInt64?
     public let permissions: UInt32?
+    public let isDirectory: Bool
 }

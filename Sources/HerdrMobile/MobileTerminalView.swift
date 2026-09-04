@@ -22,9 +22,12 @@ final class MobileAttachSession: ObservableObject {
 
     @Published var status: Status = .connecting
     @Published private(set) var collectedLinks: [URL] = []
+    @Published var isFetchingPreview = false
+    @Published var previewAlert: String?
     /// Resolved on every use rather than held: the device's transport is
     /// replaced wholesale by a reconnect, and this session outlives that.
     let provider: any MobileTransportProvider
+    let cwdProvider: () -> String?
     let target: TerminalAttachTarget
     private var channel: SSHPTYChannel?
     private var readTask: Task<Void, Never>?
@@ -50,10 +53,56 @@ final class MobileAttachSession: ObservableObject {
     /// The herdr pane behind this attach, for key/prompt RPCs.
     let paneID: String
 
-    init(provider: any MobileTransportProvider, target: TerminalAttachTarget, paneID: String) {
+    init(
+        provider: any MobileTransportProvider,
+        cwdProvider: @escaping () -> String?,
+        target: TerminalAttachTarget,
+        paneID: String
+    ) {
         self.provider = provider
+        self.cwdProvider = cwdProvider
         self.target = target
         self.paneID = paneID
+    }
+
+    func liveCwd() -> String? { cwdProvider() }
+
+    var remoteHome: String { provider.remoteHome }
+
+    func previewHostFile(_ path: String, from view: UIView) {
+        Task {
+            await self.runPreview(path, from: view)
+        }
+    }
+
+    private func runPreview(_ path: String, from view: UIView) async {
+        isFetchingPreview = true
+        defer { isFetchingPreview = false }
+        do {
+            let transport = try await provider.currentTransport()
+            let snapshot = try await HostFilePreview.fetch(path: path, using: transport)
+            guard let presenter = Self.nearestViewController(from: view) else { return }
+            HostFilePreview.present(
+                fileURL: snapshot.fileURL,
+                directoryURL: snapshot.directoryURL,
+                from: presenter
+            )
+        } catch let error as HostFilePreviewError {
+            previewAlert = error.errorDescription
+        } catch SSHError.responseTooLarge {
+            previewAlert = HostFilePreviewError.tooLarge.errorDescription
+        } catch {
+            previewAlert = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        }
+    }
+
+    private static func nearestViewController(from view: UIView) -> UIViewController? {
+        var responder: UIResponder? = view
+        while let current = responder {
+            if let vc = current as? UIViewController { return vc }
+            responder = current.next
+        }
+        return view.window?.rootViewController
     }
 
     var agentPaneID: String? {
@@ -270,6 +319,7 @@ final class MobileAttachSession: ObservableObject {
         }
         channel = nil
         attachedRevision = nil
+        HostFilePreview.removeAllCachedPreviews()
     }
 }
 
@@ -283,6 +333,7 @@ struct MobileTerminalScreen: View {
 
     init(
         provider: any MobileTransportProvider,
+        cwdProvider: @escaping () -> String?,
         target: TerminalAttachTarget,
         paneID: String,
         title: String
@@ -291,7 +342,12 @@ struct MobileTerminalScreen: View {
         // hold the provider (stable per device) rather than a transport (which
         // a reconnect replaces underneath this view).
         _session = StateObject(
-            wrappedValue: MobileAttachSession(provider: provider, target: target, paneID: paneID)
+            wrappedValue: MobileAttachSession(
+                provider: provider,
+                cwdProvider: cwdProvider,
+                target: target,
+                paneID: paneID
+            )
         )
         self.title = title
     }
@@ -303,6 +359,12 @@ struct MobileTerminalScreen: View {
                 MobileTerminalHost(session: session, keyboardShown: $keyboardShown)
                 controls
             }
+            if session.isFetchingPreview {
+                ProgressView()
+                    .tint(.white)
+                    .padding(20)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            }
             if case .ended(let reason) = session.status {
                 endedOverlay(reason)
             }
@@ -311,6 +373,19 @@ struct MobileTerminalScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbarBackground(terminalBackground, for: .navigationBar)
+        .alert(
+            String(localized: "Couldn’t Preview File"),
+            isPresented: Binding(
+                get: { session.previewAlert != nil },
+                set: { if !$0 { session.previewAlert = nil } }
+            ),
+            actions: {
+                Button(String(localized: "OK"), role: .cancel) { session.previewAlert = nil }
+            },
+            message: {
+                Text(session.previewAlert ?? "")
+            }
+        )
         .onDisappear {
             session.stop()
             session.discardCollectedLinks()
@@ -466,6 +541,7 @@ struct MobileTerminalScreen: View {
 final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
     private var scrollPanGesture: UIPanGestureRecognizer?
     private var accumulatedScrollDelta: CGFloat = 0
+    weak var attachSession: MobileAttachSession?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -494,27 +570,45 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         }
     }
 
-    func webURL(at location: CGPoint) -> URL? {
+    func detectedLink(at location: CGPoint) -> DetectedLink? {
         let terminal = getTerminal()
         let cols = max(1, terminal.cols)
         let rows = max(1, terminal.rows)
         let col = max(0, min(cols - 1, Int(location.x / max(1, bounds.width / CGFloat(cols)))))
         let row = max(0, min(rows - 1, Int(location.y / max(1, bounds.height / CGFloat(rows)))))
-        guard let raw = terminal.link(
+        if let raw = terminal.link(
             at: .screen(Position(col: col, row: row)),
             mode: .explicitAndImplicit
-        ) else { return nil }
-        return WebURL.first(in: raw)
+        ), let link = parseLink(raw) {
+            return link
+        }
+        if selection.active {
+            return parseLink(selection.getSelectedText())
+        }
+        return nil
+    }
+
+    private func parseLink(_ raw: String) -> DetectedLink? {
+        DetectedLink.parse(
+            raw,
+            cwd: attachSession?.liveCwd(),
+            home: attachSession?.remoteHome
+        )
     }
 
     func contextMenuInteraction(
         _ interaction: UIContextMenuInteraction,
         configurationForMenuAtLocation location: CGPoint
     ) -> UIContextMenuConfiguration? {
-        guard let url = webURL(at: location) else { return nil }
+        guard let link = detectedLink(at: location) else { return nil }
         return UIContextMenuConfiguration(identifier: nil, previewProvider: {
             let label = UILabel()
-            label.text = url.absoluteString
+            switch link {
+            case .web(let url):
+                label.text = url.absoluteString
+            case .hostFile(let path):
+                label.text = path
+            }
             label.font = .preferredFont(forTextStyle: .body)
             label.numberOfLines = 1
             label.lineBreakMode = .byTruncatingMiddle
@@ -524,7 +618,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             vc.preferredContentSize = CGSize(width: 280, height: 44)
             return vc
         }, actionProvider: { [weak self] _ in
-            self?.linkMenu(for: url)
+            self?.menu(for: link)
         })
     }
 
@@ -534,10 +628,36 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         suggestedActions: [UIMenuElement]
     ) -> UIMenu? {
         var actions = suggestedActions
-        if selection.active, let url = WebURL.first(in: selection.getSelectedText()) {
-            actions.append(contentsOf: linkMenu(for: url).children)
+        if selection.active, let link = parseLink(selection.getSelectedText()) {
+            actions.append(contentsOf: menu(for: link).children)
         }
         return UIMenu(children: actions)
+    }
+
+    private func menu(for link: DetectedLink) -> UIMenu {
+        switch link {
+        case .web(let url):
+            return linkMenu(for: url)
+        case .hostFile(let path):
+            return hostFileMenu(for: path)
+        }
+    }
+
+    private func hostFileMenu(for path: String) -> UIMenu {
+        let preview = UIAction(
+            title: String(localized: "Preview"),
+            image: UIImage(systemName: "eye")
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.attachSession?.previewHostFile(path, from: self)
+        }
+        let copy = UIAction(
+            title: String(localized: "Copy Path"),
+            image: UIImage(systemName: "doc.on.doc")
+        ) { _ in
+            UIPasteboard.general.string = path
+        }
+        return UIMenu(children: [preview, copy])
     }
 
     private func linkMenu(for url: URL) -> UIMenu {
@@ -761,12 +881,18 @@ private struct MobileTerminalHost: UIViewRepresentable {
         view.nativeBackgroundColor = view.backgroundColor ?? .black
         view.nativeForegroundColor = UIColor(red: 0xD6 / 255, green: 0xD6 / 255, blue: 0xD6 / 255, alpha: 1)
         session.terminalView = view
+        if let mobile = view as? MobileTerminalUIView {
+            mobile.attachSession = session
+        }
         let terminal = view.getTerminal()
         session.start(columns: terminal.cols, rows: terminal.rows)
         return view
     }
 
     func updateUIView(_ uiView: TerminalView, context: Context) {
+        if let mobile = uiView as? MobileTerminalUIView {
+            mobile.attachSession = session
+        }
         if keyboardShown, !uiView.isFirstResponder {
             _ = uiView.becomeFirstResponder()
         } else if !keyboardShown, uiView.isFirstResponder {

@@ -917,8 +917,9 @@ struct MobileTerminalScreen: View {
 }
 
 /// TerminalView subclass for iOS that translates single- and two-finger touch dragging
-/// into terminal scrolling (SGR mouse wheel for mouse-tracking sessions like herdr / tmux /
-/// agents, cursor arrow keys for alternate screen buffers, and local scrollback for normal buffers).
+/// into terminal scrolling (SGR mouse wheel for mouse-tracking sessions like herdr / tmux;
+/// page keys only on the alternate screen; local SwiftTerm scrollback otherwise —
+/// Cursor agent is a normal-buffer app, not a TUI).
 final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
     private struct LinkHit {
         let link: DetectedLink
@@ -1641,18 +1642,17 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             sendMouseWheel(up: up, times: twoFinger ? max(3, magnitude) : magnitude, at: location)
             return
         }
-        if twoFinger || scrollThumbsize == 0 {
+        // `scrollThumbsize == 0` is SwiftTerm's public signal for the
+        // alternate screen (no local history). Two-finger used to always
+        // inject page_up into the PTY, which Cursor ignores — its transcript
+        // lives in the normal buffer.
+        if scrollThumbsize == 0 {
             let key = up ? "page_up" : "page_down"
             if let session = attachSession, session.agentPaneID != nil {
                 session.sendKeys([key])
             } else {
                 send(txt: up ? "\u{1b}[5~" : "\u{1b}[6~")
             }
-            return
-        }
-
-        if reportsMouse {
-            sendMouseWheel(up: up, times: magnitude, at: location)
             return
         }
         if up {

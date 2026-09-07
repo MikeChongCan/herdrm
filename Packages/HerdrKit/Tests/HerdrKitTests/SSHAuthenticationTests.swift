@@ -211,7 +211,7 @@ final class SSHFileTransferTests: XCTestCase {
         #!/bin/sh
         printf '%s\\n' "$@" > \(HerdrService.shellQuoted(argumentsURL.path))
         cat > \(HerdrService.shellQuoted(capturedURL.path))
-        printf '/home/test/.cache/herdrm/attachments/test.png\\n'
+        printf '/tmp/herdrm-attachments/test.png\\n'
         """
         try script.write(to: executableURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executableURL.path)
@@ -224,7 +224,7 @@ final class SSHFileTransferTests: XCTestCase {
             executableURL: executableURL
         )
 
-        XCTAssertEqual(remotePath, "/home/test/.cache/herdrm/attachments/test.png")
+        XCTAssertEqual(remotePath, "/tmp/herdrm-attachments/test.png")
         XCTAssertEqual(try Data(contentsOf: capturedURL), payload)
         let arguments = try String(contentsOf: argumentsURL, encoding: .utf8)
         XCTAssertTrue(arguments.contains("ssh://test@example.invalid:2222"))

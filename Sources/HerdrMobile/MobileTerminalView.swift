@@ -9,9 +9,9 @@ import UIKit
 /// when the channel EOFs (takeover by another client, pane closed, network).
 ///
 /// Mobile terminals are display-first (Heeler's ADR 0013 insight): the live
-/// pane renders, but typing goes through the composer (`agent.prompt`) and a
-/// key bar (`pane.send_input` keys), which herdr encodes properly server-side.
-/// A keyboard toggle still allows raw typing for TUI menus that need it.
+/// pane renders through this attach, composer prompts use `agent.prompt`, and
+/// TUI typing while the PTY has focus uses `pane.send_input`. Agent panes never
+/// write raw bytes to the attach PTY; copy/select still works.
 @MainActor
 final class MobileAttachSession: ObservableObject {
     enum Status: Equatable {
@@ -23,6 +23,7 @@ final class MobileAttachSession: ObservableObject {
     @Published var status: Status = .connecting
     @Published private(set) var collectedLinks: [URL] = []
     @Published var isFetchingPreview = false
+    @Published var isStagingAttachment = false
     @Published var previewAlert: String?
     /// Resolved on every use rather than held: the device's transport is
     /// replaced wholesale by a reconnect, and this session outlives that.
@@ -281,6 +282,44 @@ final class MobileAttachSession: ObservableObject {
         }
     }
 
+    /// Types into the pane without submitting (no trailing Enter).
+    func sendText(_ text: String) {
+        Task {
+            guard let transport = try? await self.provider.currentTransport() else { return }
+            _ = try? await transport.request(
+                method: "pane.send_input",
+                params: .object([
+                    "pane_id": .string(self.paneID),
+                    "text": .string(text),
+                ])
+            )
+        }
+    }
+
+    func stageClipboardPaths() async -> String? {
+        guard !isStagingAttachment else { return nil }
+        isStagingAttachment = true
+        defer { isStagingAttachment = false }
+        do {
+            return try await MobileAttachmentStager.stageQuotedPaths(using: provider)
+        } catch {
+            previewAlert = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            return nil
+        }
+    }
+
+    func stageLocalURLs(_ urls: [URL]) async -> String? {
+        guard !isStagingAttachment else { return nil }
+        isStagingAttachment = true
+        defer { isStagingAttachment = false }
+        do {
+            return try await MobileAttachmentStager.stageLocalURLs(urls, using: provider)
+        } catch {
+            previewAlert = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            return nil
+        }
+    }
+
     func pageUp() {
         if let terminalView {
             terminalView.pageUp()
@@ -323,20 +362,88 @@ final class MobileAttachSession: ObservableObject {
     }
 }
 
+@MainActor
+final class TerminalInputChrome: ObservableObject {
+    enum IMEItem {
+        case partial(String)
+        case final(String)
+    }
+
+    let dictation = VoiceDictationController()
+    let compactBar = HerdrInputAccessory()
+    let agentAccessory = HerdrInputAccessory()
+    let shellAccessory = HerdrInputAccessory()
+    weak var composerView: VoiceComposerTextView?
+    private var queue: [IMEItem] = []
+    @Published var isRecording = false
+    @Published var statusCaption = ""
+
+    init() {
+        dictation.onRecordingChange = { [weak self] recording in
+            self?.isRecording = recording
+            self?.compactBar.setRecording(recording)
+            self?.agentAccessory.setRecording(recording)
+            self?.shellAccessory.setRecording(recording)
+        }
+        dictation.onStatus = { [weak self] text in
+            self?.statusCaption = text
+            self?.compactBar.setStatusCaption(text)
+            self?.agentAccessory.setStatusCaption(text)
+            self?.shellAccessory.setStatusCaption(text)
+        }
+        dictation.onPartial = { [weak self] text in
+            self?.enqueue(.partial(text))
+        }
+        dictation.onFinal = { [weak self] text in
+            self?.enqueue(.final(text))
+        }
+    }
+
+    func enqueue(_ item: IMEItem) {
+        queue.append(item)
+        flush()
+    }
+
+    func flush() {
+        guard let view = composerView, view.window != nil, view.isFirstResponder else { return }
+        let items = queue
+        queue.removeAll()
+        for item in items {
+            switch item {
+            case .partial(let text): view.applyIMEPartial(text)
+            case .final(let text): view.applyIMEFinal(text)
+            }
+        }
+    }
+
+    func applyLeftover(_ text: String) {
+        enqueue(.final(text))
+    }
+}
+
 struct MobileTerminalScreen: View {
     @StateObject private var session: MobileAttachSession
-    @State private var composerText = ""
+    @StateObject private var chrome = TerminalInputChrome()
+    @State private var composerText: String
     @State private var keyboardShown = false
+    @State private var ptyIsTypingTarget = false
+    @State private var composerIsFirstResponder = false
+    @State private var softwareKeyboardVisible = false
     @State private var showingLinks = false
+    @State private var clipboardHasAttachment = MobileAttachmentStager.clipboardHasAttachment()
     @Environment(\.scenePhase) private var scenePhase
     private let title: String
+    private let draftKey: String
+    private let onOpenVoiceSettings: () -> Void
 
     init(
         provider: any MobileTransportProvider,
         cwdProvider: @escaping () -> String?,
         target: TerminalAttachTarget,
         paneID: String,
-        title: String
+        title: String,
+        draftKey: String,
+        onOpenVoiceSettings: @escaping () -> Void = {}
     ) {
         // `StateObject` keeps the first value it is given, so the session must
         // hold the provider (stable per device) rather than a transport (which
@@ -350,16 +457,26 @@ struct MobileTerminalScreen: View {
             )
         )
         self.title = title
+        self.draftKey = draftKey
+        self.onOpenVoiceSettings = onOpenVoiceSettings
+        _composerText = State(initialValue: ComposerDraftStore.load(draftKey))
     }
 
     var body: some View {
         ZStack {
             terminalBackground.ignoresSafeArea()
             VStack(spacing: 0) {
-                MobileTerminalHost(session: session, keyboardShown: $keyboardShown)
+                MobileTerminalHost(
+                    session: session,
+                    keyboardShown: $keyboardShown,
+                    ptyIsTypingTarget: $ptyIsTypingTarget,
+                    herdrAccessory: chrome.shellAccessory
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
                 controls
             }
-            if session.isFetchingPreview {
+            if session.isFetchingPreview || session.isStagingAttachment {
                 ProgressView()
                     .tint(.white)
                     .padding(20)
@@ -386,9 +503,54 @@ struct MobileTerminalScreen: View {
                 Text(session.previewAlert ?? "")
             }
         )
+        .onAppear { wireChrome() }
+        .onChange(of: keyboardShown) { _, _ in
+            updateKeyboardChrome()
+            relayoutTerminal()
+        }
+        .onChange(of: ptyIsTypingTarget) { _, _ in
+            updateKeyboardChrome()
+            relayoutTerminal()
+        }
+        .onChange(of: hideCompactRow) { _, _ in
+            relayoutTerminal()
+        }
+        .onChange(of: showsDraft) { _, _ in
+            relayoutTerminal()
+        }
+        .onChange(of: clipboardHasAttachment) { _, has in
+            chrome.compactBar.setPasteEnabled(has)
+            chrome.agentAccessory.setPasteEnabled(has)
+            chrome.shellAccessory.setPasteEnabled(has)
+        }
         .onDisappear {
+            chrome.dictation.cancel()
+            ComposerDraftStore.save(draftKey, text: composerText)
             session.stop()
             session.discardCollectedLinks()
+        }
+        .onChange(of: composerText) { _, text in
+            ComposerDraftStore.save(draftKey, text: text)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            let terminalFR = session.terminalView?.isFirstResponder == true
+            QALog.add("keyboardWillShow terminalFR=\(terminalFR) composerFR=\(composerIsFirstResponder) keyboardShown=\(keyboardShown)")
+            if isAgent, terminalFR, !ptyIsTypingTarget {
+                return
+            }
+            softwareKeyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            QALog.add("keyboardWillHide composerFR=\(composerIsFirstResponder) keyboardShown=\(keyboardShown)")
+            softwareKeyboardVisible = false
+            // Do not clear `ptyIsTypingTarget` here. Composer → PTY handoff
+            // fires willHide while the terminal is already (or about to be)
+            // first responder; resigning would abort TUI typing. Swipe-down
+            // resigns SwiftTerm, and `onPTYFocusEnded` drops the flag.
+            if !ptyIsTypingTarget, !composerIsFirstResponder {
+                keyboardShown = false
+            }
+            relayoutTerminal()
         }
         .sheet(isPresented: $showingLinks) {
             collectedLinksSheet
@@ -396,7 +558,13 @@ struct MobileTerminalScreen: View {
         .onChange(of: scenePhase) { _, phase in
             // The attach cannot outlive a suspension: re-prove the transport
             // and re-attach (`--takeover`) when the session behind it is gone.
-            if phase == .active { session.resumeAfterForeground() }
+            if phase == .active {
+                session.resumeAfterForeground()
+                clipboardHasAttachment = MobileAttachmentStager.clipboardHasAttachment()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIPasteboard.changedNotification)) { _ in
+            clipboardHasAttachment = MobileAttachmentStager.clipboardHasAttachment()
         }
     }
 
@@ -404,53 +572,79 @@ struct MobileTerminalScreen: View {
         SwiftUI.Color(red: 0x10 / 255, green: 0x10 / 255, blue: 0x12 / 255)
     }
 
+    private var isAgent: Bool { session.agentPaneID != nil }
+
+    private var showsDraft: Bool {
+        isAgent && (keyboardShown || (chrome.isRecording && !agentPTYIsTyping) || !composerText.isEmpty)
+    }
+
+    private var hideCompactRow: Bool {
+        softwareKeyboardVisible && typingTargetIsFirstResponder
+    }
+
+    private var agentPTYIsTyping: Bool {
+        isAgent && ptyIsTypingTarget && session.terminalView?.isFirstResponder == true
+    }
+
+    private var typingTargetIsFirstResponder: Bool {
+        if isAgent {
+            return agentPTYIsTyping || (!ptyIsTypingTarget && composerIsFirstResponder)
+        }
+        return session.terminalView?.isFirstResponder == true
+    }
+
+    private var keyboardTargetRequested: Bool {
+        keyboardShown || ptyIsTypingTarget
+    }
+
+    private func updateKeyboardChrome() {
+        chrome.compactBar.setKeyboardVisible(keyboardTargetRequested)
+        chrome.agentAccessory.setKeyboardVisible(keyboardTargetRequested)
+        chrome.shellAccessory.setKeyboardVisible(keyboardTargetRequested)
+    }
+
+    private func relayoutTerminal() {
+        DispatchQueue.main.async {
+            guard let view = session.terminalView else { return }
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            QALog.add("relayout terminal bounds=\(Int(view.bounds.width))x\(Int(view.bounds.height)) cols=\(view.getTerminal().cols) rows=\(view.getTerminal().rows)")
+        }
+    }
+
     private var controls: some View {
-        VStack(spacing: 8) {
-            keyBar
-            if session.agentPaneID != nil {
+        VStack(spacing: 6) {
+            if isAgent {
                 composer
+                    .frame(minHeight: showsDraft ? 36 : 0, maxHeight: showsDraft ? 88 : 0)
+                    .clipped()
+                    .opacity(showsDraft ? 1 : 0)
+                    .accessibilityHidden(!showsDraft)
+            }
+            if !hideCompactRow {
+                HerdrToolbarHost(bar: chrome.compactBar)
+                    .frame(height: HerdrInputAccessory.barHeight)
+                    .accessibilityIdentifier("chrome.toolbar")
+            }
+            if !hideCompactRow,
+               !chrome.statusCaption.isEmpty,
+               chrome.statusCaption != String(localized: "Tap to dictate")
+            {
+                Text(chrome.statusCaption)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onTapGesture { onOpenVoiceSettings() }
+                    .accessibilityIdentifier("voice.status")
             }
         }
         .padding(.horizontal, 10)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.top, hideCompactRow ? 4 : 8)
+        .padding(.bottom, hideCompactRow ? 4 : 6)
         .background(.black.opacity(0.35))
-    }
-
-    private var keyBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                if !session.collectedLinks.isEmpty {
-                    Button {
-                        showingLinks = true
-                    } label: {
-                        Text(linkChipLabel)
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.85))
-                            .frame(minWidth: 34)
-                            .frame(height: 30)
-                            .padding(.horizontal, 4)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
-                    }
-                }
-                KeyChip("esc") { session.sendKeys(["esc"]) }
-                KeyChip("tab") { session.sendKeys(["tab"]) }
-                KeyChip("↑") { session.sendKeys(["up"]) }
-                KeyChip("↓") { session.sendKeys(["down"]) }
-                KeyChip("⇞") { session.pageUp() }
-                KeyChip("⇟") { session.pageDown() }
-                KeyChip("⏎") { session.sendKeys(["enter"]) }
-                KeyChip("^C") { session.sendKeys(["ctrl+c"]) }
-                Button {
-                    keyboardShown.toggle()
-                } label: {
-                    Image(systemName: keyboardShown ? "keyboard.chevron.compact.down" : "keyboard")
-                        .foregroundStyle(.white.opacity(0.75))
-                        .frame(width: 34, height: 30)
-                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
-                }
-            }
-        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var linkChipLabel: String {
@@ -486,38 +680,225 @@ struct MobileTerminalScreen: View {
     }
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            TextField(
-                String(localized: "Message the agent…"),
+        HStack(alignment: .bottom, spacing: 8) {
+            VoiceComposerField(
                 text: $composerText,
-                axis: .vertical
+                isEditable: showsDraft,
+                wantsKeyboard: keyboardShown,
+                accessory: chrome.agentAccessory,
+                onSubmit: { sendPrompt(submit: true) },
+                onPasteAttachments: pasteClipboardAttachment,
+                onBeginEditing: {
+                    composerIsFirstResponder = true
+                    ptyIsTypingTarget = false
+                    keyboardShown = true
+                    QALog.add("composer beginEditing")
+                },
+                onEndEditing: {
+                    composerIsFirstResponder = false
+                    if !ptyIsTypingTarget {
+                        keyboardShown = false
+                    }
+                    QALog.add("composer endEditing")
+                },
+                onAttach: { view in
+                    chrome.composerView = view
+                    chrome.flush()
+                }
             )
-            .lineLimit(1...4)
-            .textFieldStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 4)
             .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-            .foregroundStyle(.white)
-            .tint(.white)
-            .onSubmit(sendPrompt)
 
-            Button(action: sendPrompt) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 28))
-                    .foregroundStyle(
-                        composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? SwiftUI.Color.white.opacity(0.25) : SwiftUI.Color.accentColor
-                    )
+            if showsDraft {
+                ComposerSendButton(
+                    isEnabled: true,
+                    onSend: { sendPrompt(submit: true) },
+                    onSendWithoutNewline: { sendPrompt(submit: false) }
+                )
+                .frame(width: 32, height: 32)
             }
-            .disabled(composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 
-    private func sendPrompt() {
-        let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        session.prompt(text)
-        composerText = ""
+    private func wireChrome() {
+        chrome.dictation.contextProvider = {
+            DictationContext.capture(
+                cwd: session.liveCwd(),
+                title: title,
+                terminal: session.terminalView
+            )
+        }
+        chrome.dictation.onNeedsSettings = onOpenVoiceSettings
+        chrome.dictation.onPartial = { [chrome, session] text in
+            if session.agentPaneID != nil {
+                if let terminal = session.terminalView as? MobileTerminalUIView,
+                   terminal.isPTYTypingTarget, terminal.isFirstResponder
+                {
+                    // SwiftTerm's marked-text implementation writes to the
+                    // attach channel. PTY dictation keeps partials in chrome.
+                    chrome.statusCaption = text
+                } else {
+                    chrome.enqueue(.partial(text))
+                }
+            } else {
+                chrome.statusCaption = text
+            }
+        }
+        chrome.dictation.onFinal = { [chrome, session] text in
+            if session.agentPaneID != nil {
+                if let terminal = session.terminalView as? MobileTerminalUIView,
+                   terminal.isPTYTypingTarget, terminal.isFirstResponder
+                {
+                    session.sendText(text)
+                } else {
+                    chrome.enqueue(.final(text))
+                }
+            } else {
+                session.terminalView?.insertText(text)
+            }
+        }
+        let wire: (HerdrInputAccessory) -> Void = { accessory in
+            accessory.onMicToggle = { toggleDictation() }
+            accessory.onMicHoldStart = { Task { await startDictation() } }
+            accessory.onMicHoldStop = { Task { await stopDictation(waitForTrailing: true) } }
+            accessory.onSendKeys = { keys in
+                if keys == ["page_up"] {
+                    session.pageUp()
+                } else if keys == ["page_down"] {
+                    session.pageDown()
+                } else {
+                    session.sendKeys(keys)
+                }
+            }
+            accessory.onPaste = { pasteClipboardAttachment() }
+            accessory.onShareLogs = { presentQALog() }
+            accessory.onToggleKeyboard = {
+                if isAgent, ptyIsTypingTarget {
+                    ptyIsTypingTarget = false
+                    keyboardShown = false
+                    _ = session.terminalView?.resignFirstResponder()
+                } else {
+                    keyboardShown.toggle()
+                }
+                QALog.add("keyboardShown -> \(keyboardShown)")
+                if !keyboardShown {
+                    _ = chrome.composerView?.resignFirstResponder()
+                    if !isAgent {
+                        _ = session.terminalView?.resignFirstResponder()
+                    }
+                }
+            }
+            accessory.setKeyboardVisible(keyboardTargetRequested)
+            accessory.setPasteEnabled(clipboardHasAttachment)
+        }
+        wire(chrome.compactBar)
+        wire(chrome.agentAccessory)
+        wire(chrome.shellAccessory)
+    }
+
+    private func presentQALog() {
+        Task {
+            do {
+                let url = try QALog.fileURL()
+                defer { try? FileManager.default.removeItem(at: url) }
+                guard let paths = await session.stageLocalURLs([url]) else { return }
+                insertComposerText(paths)
+                QALog.add("attached log \(paths)")
+            } catch {
+                session.previewAlert = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+        }
+    }
+
+    private func toggleDictation() {
+        if chrome.dictation.isRecording {
+            Task { await stopDictation(waitForTrailing: true) }
+        } else {
+            Task { await startDictation() }
+        }
+    }
+
+    private func startDictation() async {
+        if isAgent {
+            if !agentPTYIsTyping {
+                ptyIsTypingTarget = false
+                keyboardShown = true
+            }
+        } else {
+            keyboardShown = true
+        }
+        await chrome.dictation.start()
+        if !agentPTYIsTyping {
+            chrome.flush()
+        }
+    }
+
+    private func stopDictation(waitForTrailing: Bool) async {
+        let leftover = await chrome.dictation.stop(waitForTrailingFinal: waitForTrailing)
+        if agentPTYIsTyping {
+            if !leftover.isEmpty {
+                session.sendText(leftover)
+            }
+        } else if isAgent {
+            chrome.composerView?.commitMarkedIfNeeded()
+            if !leftover.isEmpty {
+                chrome.applyLeftover(leftover)
+            }
+        } else if !leftover.isEmpty {
+            session.terminalView?.insertText(leftover)
+        }
+    }
+
+    private func sendPrompt(submit: Bool) {
+        Task { @MainActor in
+            if chrome.dictation.isRecording {
+                await stopDictation(waitForTrailing: false)
+            }
+            chrome.composerView?.commitMarkedIfNeeded()
+            let text = (chrome.composerView?.unmarkedText ?? composerText)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                guard submit else { return }
+                session.sendKeys(["enter"])
+                return
+            }
+            if submit {
+                session.prompt(text)
+            } else {
+                session.sendText(text)
+            }
+            InputHistoryStore.append(text: text, paneID: session.paneID, title: title)
+            composerText = ""
+            chrome.composerView?.text = ""
+            ComposerDraftStore.save(draftKey, text: "")
+        }
+    }
+
+    private func pasteClipboardAttachment() {
+        Task {
+            guard let paths = await session.stageClipboardPaths() else { return }
+            if session.agentPaneID != nil {
+                insertComposerText(paths)
+            } else {
+                session.send(Array(paths.utf8)[...])
+            }
+        }
+    }
+
+    private func insertComposerText(_ chunk: String) {
+        if let view = chrome.composerView, view.isFirstResponder {
+            if !(view.unmarkedText.isEmpty || view.unmarkedText.hasSuffix(" ") || view.unmarkedText.hasSuffix("\n")) {
+                view.insertText(" ")
+            }
+            view.insertText(chunk)
+            view.republishUnmarked()
+            return
+        }
+        if composerText.isEmpty || composerText.hasSuffix(" ") || composerText.hasSuffix("\n") {
+            composerText += chunk
+        } else {
+            composerText += " " + chunk
+        }
     }
 
     private func endedOverlay(_ reason: String) -> some View {
@@ -542,24 +923,219 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     private struct LinkHit {
         let link: DetectedLink
         let displayText: String
-        let rect: CGRect
+        let rects: [CGRect]
+
+        var rect: CGRect {
+            rects.reduce(CGRect.null) { $0.union($1) }
+        }
     }
 
     private var scrollPanGesture: UIPanGestureRecognizer?
     private var accumulatedScrollDelta: CGFloat = 0
     weak var attachSession: MobileAttachSession?
+    var isAgentPane = false
+    var isPTYTypingTarget = false
+    var herdrAccessory: UIView?
+    var onRequestPTYFocus: (() -> Void)?
+    var onPTYFocusEnded: (() -> Void)?
     private var lastLinkHit: LinkHit?
+    private var highlightOverlay: UIView?
+    private var focusTap: UITapGestureRecognizer?
+    private var presentingContextMenu = false
+
+    private static let dummyKeyboard: UIInputView = {
+        let view = UIInputView(
+            frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 0),
+            inputViewStyle: .keyboard
+        )
+        view.allowsSelfSizing = true
+        return view
+    }()
+
+    func applyInputChrome() {
+        if isAgentPane {
+            inputAccessoryView = isPTYTypingTarget ? herdrAccessory : nil
+            inputView = isFirstResponder && !isPTYTypingTarget ? Self.dummyKeyboard : nil
+        } else {
+            inputAccessoryView = herdrAccessory
+            inputView = nil
+        }
+        if isFirstResponder {
+            reloadInputViews()
+        }
+    }
+
+    override func insertText(_ text: String) {
+        if isAgentPane {
+            guard isPTYTypingTarget else { return }
+            if text == "\n" || text == "\r" || text == "\r\n" {
+                attachSession?.sendKeys(["enter"])
+            } else {
+                attachSession?.sendText(text)
+            }
+            return
+        }
+        super.insertText(text)
+    }
+
+    override func deleteBackward() {
+        if isAgentPane {
+            guard isPTYTypingTarget else { return }
+            attachSession?.sendKeys(["backspace"])
+            return
+        }
+        super.deleteBackward()
+    }
+
+    override func paste(_ sender: Any?) {
+        if isAgentPane {
+            guard isPTYTypingTarget else { return }
+            if let text = UIPasteboard.general.string, !text.isEmpty {
+                attachSession?.sendText(text)
+            }
+            return
+        }
+        super.paste(sender)
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupTouchScrolling()
         installLinkMenus()
+        installFocusTap()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupTouchScrolling()
         installLinkMenus()
+        installFocusTap()
+    }
+
+    private func installFocusTap() {
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap))
+        tap.cancelsTouchesInView = false
+        tap.delegate = self
+        addGestureRecognizer(tap)
+        focusTap = tap
+        if let pan = scrollPanGesture {
+            tap.require(toFail: pan)
+        }
+    }
+
+    @objc private func handleFocusTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended else { return }
+        guard !isSelectionOrMenuActive else { return }
+        QALog.add("terminal tap requestPTYFocus agent=\(isAgentPane)")
+        onRequestPTYFocus?()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        if isAgentPane, !isPTYTypingTarget {
+            // Long-press copy/select may make SwiftTerm first responder before
+            // SwiftUI has a chance to update. Keep its zero-height input view
+            // only for that non-typing state.
+            inputAccessoryView = nil
+            inputView = Self.dummyKeyboard
+        }
+        let ok = super.becomeFirstResponder()
+        if ok, isAgentPane, isPTYTypingTarget {
+            applyInputChrome()
+        }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned, isAgentPane {
+            onPTYFocusEnded?()
+        }
+        return resigned
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        guard isAgentPane, isPTYTypingTarget else {
+            super.pressesBegan(presses, with: event)
+            return
+        }
+
+        var unhandled: Set<UIPress> = []
+        for press in presses {
+            guard let key = press.key,
+                  !key.modifierFlags.contains(.command),
+                  let namedKey = Self.herdrKey(for: key)
+            else {
+                unhandled.insert(press)
+                continue
+            }
+            attachSession?.sendKeys([namedKey])
+        }
+        if !unhandled.isEmpty {
+            super.pressesBegan(unhandled, with: event)
+        }
+    }
+
+    private static func herdrKey(for key: UIKey) -> String? {
+        switch key.keyCode {
+        case .keyboardReturnOrEnter:
+            return "enter"
+        case .keyboardDeleteOrBackspace:
+            return "backspace"
+        case .keyboardUpArrow:
+            return "up"
+        case .keyboardDownArrow:
+            return "down"
+        case .keyboardLeftArrow:
+            return "left"
+        case .keyboardRightArrow:
+            return "right"
+        case .keyboardPageUp:
+            return "page_up"
+        case .keyboardPageDown:
+            return "page_down"
+        case .keyboardHome:
+            return "home"
+        case .keyboardEnd:
+            return "end"
+        case .keyboardDeleteForward:
+            return "delete"
+        case .keyboardEscape:
+            return "esc"
+        case .keyboardTab:
+            return "tab"
+        case .keyboardF1:
+            return "f1"
+        case .keyboardF2:
+            return "f2"
+        case .keyboardF3:
+            return "f3"
+        case .keyboardF4:
+            return "f4"
+        case .keyboardF5:
+            return "f5"
+        case .keyboardF6:
+            return "f6"
+        case .keyboardF7:
+            return "f7"
+        case .keyboardF8:
+            return "f8"
+        case .keyboardF9:
+            return "f9"
+        case .keyboardF10:
+            return "f10"
+        default:
+            guard key.modifierFlags.contains(.control) else { return nil }
+            let character = key.charactersIgnoringModifiers.lowercased()
+            guard character.utf8.count == 1,
+                  let scalar = character.unicodeScalars.first,
+                  scalar.isASCII, scalar.properties.isAlphabetic
+            else { return nil }
+            return "ctrl+\(character)"
+        }
+    }
+
+    var isSelectionOrMenuActive: Bool {
+        selection.active || presentingContextMenu
     }
 
     private func installLinkMenus() {
@@ -583,16 +1159,20 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     ) -> UIContextMenuConfiguration? {
         guard let hit = linkHit(at: location) else {
             lastLinkHit = nil
+            presentingContextMenu = false
             return nil
         }
         lastLinkHit = hit
+        presentingContextMenu = true
         let link = hit.link
         let display = hit.displayText
-        return UIContextMenuConfiguration(identifier: display as NSString, previewProvider: {
-            Self.snippetPreviewController(text: display)
-        }, actionProvider: { [weak self] _ in
-            self?.menu(for: link)
-        })
+        return UIContextMenuConfiguration(
+            identifier: display as NSString,
+            previewProvider: { LinkPreviewCardController(link: link) },
+            actionProvider: { [weak self] _ in
+                self?.menu(for: link)
+            }
+        )
     }
 
     func contextMenuInteraction(
@@ -600,7 +1180,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         configuration: UIContextMenuConfiguration,
         highlightPreviewForItemWithIdentifier identifier: any NSCopying
     ) -> UITargetedPreview? {
-        snippetTargetedPreview()
+        liftedLinkPreview()
     }
 
     func contextMenuInteraction(
@@ -608,7 +1188,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         configuration: UIContextMenuConfiguration,
         dismissalPreviewForItemWithIdentifier identifier: any NSCopying
     ) -> UITargetedPreview? {
-        snippetTargetedPreview()
+        liftedLinkPreview()
     }
 
     func contextMenuInteraction(
@@ -617,7 +1197,10 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         animator: UIContextMenuInteractionAnimating?
     ) {
         animator?.addCompletion { [weak self] in
+            self?.highlightOverlay?.removeFromSuperview()
+            self?.highlightOverlay = nil
             self?.lastLinkHit = nil
+            self?.presentingContextMenu = false
         }
     }
 
@@ -642,29 +1225,120 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             at: .screen(Position(col: col, row: row)),
             mode: .explicitAndImplicit
         ), let link = parseLink(raw) {
-            let display = onScreenToken(raw: raw, screenRow: row, tapCol: col, cols: cols, terminal: terminal)
-            let span = columnSpan(of: display, inScreenRow: row, tapCol: col, cols: cols, terminal: terminal)
-            return LinkHit(link: link, displayText: display, rect: cellRect(startCol: span.start, endCol: span.end, row: row, cellW: cellW, cellH: cellH))
+            let display = previewString(for: link, fallback: raw)
+            let rects = wrappedRects(
+                covering: raw,
+                tapRow: row,
+                tapCol: col,
+                cols: cols,
+                rows: rows,
+                terminal: terminal,
+                cellW: cellW,
+                cellH: cellH
+            )
+            return LinkHit(link: link, displayText: display, rects: rects)
         }
         if selection.active, let link = parseLink(selection.getSelectedText()) {
-            let display = selection.getSelectedText().trimmingCharacters(in: .whitespacesAndNewlines)
+            let display = previewString(for: link, fallback: selection.getSelectedText())
             guard !display.isEmpty else { return nil }
             let yDisp = terminal.buffer.yDisp
             let startRow = selection.start.row - yDisp
             let endRow = selection.end.row - yDisp
-            if startRow == row || endRow == row || (startRow...endRow).contains(row) {
-                let startCol = startRow == row ? selection.start.col : 0
-                let endCol = endRow == row ? selection.end.col + 1 : cols
-                return LinkHit(
-                    link: link,
-                    displayText: display,
-                    rect: cellRect(startCol: startCol, endCol: endCol, row: row, cellW: cellW, cellH: cellH)
-                )
+            var rects: [CGRect] = []
+            if startRow == row || endRow == row || (min(startRow, endRow)...max(startRow, endRow)).contains(row) {
+                let lo = min(startRow, endRow)
+                let hi = max(startRow, endRow)
+                for r in lo...hi where r >= 0 && r < rows {
+                    let startCol = r == startRow ? selection.start.col : 0
+                    let endCol = r == endRow ? selection.end.col + 1 : cols
+                    rects.append(cellRect(startCol: startCol, endCol: endCol, row: r, cellW: cellW, cellH: cellH))
+                }
             }
-            let span = columnSpan(of: display, inScreenRow: row, tapCol: col, cols: cols, terminal: terminal)
-            return LinkHit(link: link, displayText: display, rect: cellRect(startCol: span.start, endCol: span.end, row: row, cellW: cellW, cellH: cellH))
+            if rects.isEmpty {
+                let span = columnSpan(of: display, inScreenRow: row, tapCol: col, cols: cols, terminal: terminal)
+                rects = [cellRect(startCol: span.start, endCol: span.end, row: row, cellW: cellW, cellH: cellH)]
+            }
+            return LinkHit(link: link, displayText: display, rects: rects)
         }
         return nil
+    }
+
+    private func previewString(for link: DetectedLink, fallback: String) -> String {
+        let value: String
+        switch link {
+        case .web(let url):
+            value = url.absoluteString
+        case .hostFile(let path):
+            value = path
+        }
+        return value.isEmpty ? fallback : value
+    }
+
+    private func wrappedRects(
+        covering raw: String,
+        tapRow: Int,
+        tapCol: Int,
+        cols: Int,
+        rows: Int,
+        terminal: Terminal,
+        cellW: CGFloat,
+        cellH: CGFloat
+    ) -> [CGRect] {
+        let needle = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = (0..<rows).map { screenLine(row: $0, cols: cols, terminal: terminal) }
+        let visible = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) as NSString }
+        var offsets: [Int] = []
+        var total = 0
+        for s in visible {
+            offsets.append(total)
+            total += s.length
+        }
+        let joined = visible.reduce(into: "") { $0 += $1 as String } as NSString
+        var search = NSRange(location: 0, length: joined.length)
+        var chosen: NSRange?
+        let tapOffset = offsets.indices.contains(tapRow)
+            ? offsets[tapRow] + min(max(0, tapCol), max(0, visible[tapRow].length))
+            : 0
+        while !needle.isEmpty {
+            let found = joined.range(of: needle, options: [], range: search)
+            if found.location == NSNotFound { break }
+            if NSLocationInRange(tapOffset, found)
+                || abs(Int(found.location) - tapOffset)
+                < abs(Int((chosen ?? NSRange(location: Int.max, length: 0)).location) - tapOffset)
+            {
+                chosen = found
+                if NSLocationInRange(tapOffset, found) { break }
+            }
+            let next = found.location + max(1, found.length)
+            if next >= joined.length { break }
+            search = NSRange(location: next, length: joined.length - next)
+        }
+
+        if let match = chosen {
+            var rects: [CGRect] = []
+            for (row, text) in visible.enumerated() {
+                let start = offsets[row]
+                let end = start + text.length
+                let overlapStart = max(match.location, start)
+                let overlapEnd = min(match.location + match.length, end)
+                if overlapStart < overlapEnd {
+                    rects.append(
+                        cellRect(
+                            startCol: overlapStart - start,
+                            endCol: overlapEnd - start,
+                            row: row,
+                            cellW: cellW,
+                            cellH: cellH
+                        )
+                    )
+                }
+            }
+            if !rects.isEmpty { return rects }
+        }
+
+        let token = onScreenToken(raw: raw, screenRow: tapRow, tapCol: tapCol, cols: cols, terminal: terminal)
+        let span = columnSpan(of: token, inScreenRow: tapRow, tapCol: tapCol, cols: cols, terminal: terminal)
+        return [cellRect(startCol: span.start, endCol: span.end, row: tapRow, cellW: cellW, cellH: cellH)]
     }
 
     private func screenLine(row: Int, cols: Int, terminal: Terminal) -> String {
@@ -745,47 +1419,39 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         ).insetBy(dx: -2, dy: -1)
     }
 
-    private func snippetTargetedPreview() -> UITargetedPreview? {
+    /// Lift a blue highlight over every wrapped URL cell; the card is previewProvider.
+    private func liftedLinkPreview() -> UITargetedPreview? {
         guard let hit = lastLinkHit else { return nil }
-        let chip = Self.makeSnippetChip(text: hit.displayText, fitting: hit.rect.size)
+        let overlay = installHighlight(for: hit)
         let params = UIPreviewParameters()
-        // Clear so the system doesn't paint the terminal color over the chip;
-        // the border and lifted fill are what separate it from the blur.
         params.backgroundColor = .clear
-        params.visiblePath = UIBezierPath(roundedRect: chip.bounds, cornerRadius: 8)
-        let target = UIPreviewTarget(container: self, center: CGPoint(x: hit.rect.midX, y: hit.rect.midY))
-        return UITargetedPreview(view: chip, parameters: params, target: target)
+        params.visiblePath = UIBezierPath(roundedRect: overlay.bounds, cornerRadius: 6)
+        return UITargetedPreview(view: overlay, parameters: params)
     }
 
-    private static func makeSnippetChip(text: String, fitting size: CGSize) -> UIView {
-        let label = UILabel()
-        label.text = text
-        label.font = .monospacedSystemFont(ofSize: max(12, size.height * 0.62), weight: .medium)
-        label.textColor = .white
-        label.lineBreakMode = .byTruncatingMiddle
-        label.numberOfLines = 1
-        label.textAlignment = .center
-        let padX: CGFloat = 10
-        let padY: CGFloat = 6
-        let width = max(size.width + padX * 2, label.intrinsicContentSize.width + padX * 2)
-        let height = max(size.height + padY, label.intrinsicContentSize.height + padY * 2)
-        let chip = UIView(frame: CGRect(x: 0, y: 0, width: width, height: height))
-        chip.backgroundColor = UIColor(white: 0.24, alpha: 1)
-        chip.layer.cornerRadius = 8
-        chip.layer.borderWidth = 1.5
-        chip.layer.borderColor = UIColor.white.withAlphaComponent(0.55).cgColor
-        chip.layer.masksToBounds = true
-        label.frame = chip.bounds.insetBy(dx: padX, dy: padY)
-        chip.addSubview(label)
-        return chip
-    }
-
-    private static func snippetPreviewController(text: String) -> UIViewController {
-        let chip = makeSnippetChip(text: text, fitting: CGSize(width: 120, height: 28))
-        let vc = UIViewController()
-        vc.view = chip
-        vc.preferredContentSize = chip.bounds.size
-        return vc
+    private func installHighlight(for hit: LinkHit) -> UIView {
+        highlightOverlay?.removeFromSuperview()
+        let union = hit.rect.integral
+        let overlay = UIView(frame: union)
+        overlay.isUserInteractionEnabled = false
+        overlay.backgroundColor = .clear
+        let path = UIBezierPath()
+        for rect in hit.rects {
+            path.append(UIBezierPath(roundedRect: overlay.convert(rect, from: self), cornerRadius: 4))
+        }
+        let fill = CAShapeLayer()
+        fill.path = path.cgPath
+        fill.fillColor = UIColor.systemBlue.withAlphaComponent(0.28).cgColor
+        overlay.layer.addSublayer(fill)
+        let stroke = CAShapeLayer()
+        stroke.path = path.cgPath
+        stroke.fillColor = UIColor.clear.cgColor
+        stroke.strokeColor = UIColor.systemBlue.withAlphaComponent(0.85).cgColor
+        stroke.lineWidth = 1.5
+        overlay.layer.addSublayer(stroke)
+        addSubview(overlay)
+        highlightOverlay = overlay
+        return overlay
     }
 
     func editMenuInteraction(
@@ -876,6 +1542,9 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         gesture.maximumNumberOfTouches = 2
         addGestureRecognizer(gesture)
         self.scrollPanGesture = gesture
+        if let tap = focusTap {
+            tap.require(toFail: gesture)
+        }
     }
 
     override func mouseModeChanged(source: Terminal) {
@@ -906,7 +1575,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        return false
+        gestureRecognizer == focusTap || otherGestureRecognizer == focusTap
     }
 
     @objc private func handleScrollPan(_ gesture: UIPanGestureRecognizer) {
@@ -930,51 +1599,13 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             if abs(accumulatedScrollDelta) >= threshold {
                 let steps = Int(accumulatedScrollDelta / threshold)
                 accumulatedScrollDelta -= CGFloat(steps) * threshold
-
-                let scrollingUp = steps > 0 // finger dragging downward -> scroll up (view earlier content)
-                let magnitude = abs(steps)
-
-                if reportsMouse {
-                    // SGR mouse wheel reporting: Button 4 = wheel up, Button 5 = wheel down
-                    let location = gesture.location(in: self)
-                    let colWidth = max(1, bounds.width / CGFloat(max(1, terminal.cols)))
-                    let col = max(0, min(terminal.cols - 1, Int(location.x / colWidth)))
-                    let row = max(0, min(terminal.rows - 1, Int(location.y / rowHeight)))
-                    let button = scrollingUp ? 4 : 5
-                    let buttonFlags = terminal.encodeButton(
-                        button: button,
-                        release: false,
-                        shift: false,
-                        meta: false,
-                        control: false
-                    )
-                    for _ in 0..<magnitude {
-                        // sendEvent sends the SGR sequence \x1b[<64;col;rowM / \x1b[<65;col;rowM
-                        // (Do NOT use sendMotion, which adds +32 to flags and corrupts wheel events)
-                        terminal.sendEvent(
-                            buttonFlags: buttonFlags,
-                            x: col,
-                            y: row,
-                            pixelX: Int(location.x),
-                            pixelY: Int(location.y)
-                        )
-                    }
-                } else if scrollThumbsize == 0 {
-                    // Alternate screen buffer without mouse reporting (e.g. less, nano)
-                    let key = scrollingUp
-                        ? (terminal.applicationCursor ? "\u{1b}OA" : "\u{1b}[A")
-                        : (terminal.applicationCursor ? "\u{1b}OB" : "\u{1b}[B")
-                    for _ in 0..<magnitude {
-                        send(txt: key)
-                    }
-                } else {
-                    // Normal buffer with local scrollback
-                    if scrollingUp {
-                        scrollUp(lines: magnitude)
-                    } else {
-                        scrollDown(lines: magnitude)
-                    }
-                }
+                let scrollingUp = steps > 0
+                applyScroll(
+                    up: scrollingUp,
+                    steps: abs(steps),
+                    twoFinger: gesture.numberOfTouches >= 2,
+                    at: gesture.location(in: self)
+                )
             }
 
         case .ended:
@@ -982,47 +1613,12 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             let velocity = gesture.velocity(in: self).y
             if abs(velocity) > 800 {
                 let extraSteps = min(8, Int(abs(velocity) / 400))
-                let scrollingUp = velocity > 0
-                let terminal = getTerminal()
-                let reportsMouse = allowMouseReporting && terminal.mouseMode != .off
-
-                if reportsMouse {
-                    let location = gesture.location(in: self)
-                    let colWidth = max(1, bounds.width / CGFloat(max(1, terminal.cols)))
-                    let rowHeight = max(12, bounds.height / CGFloat(max(1, terminal.rows)))
-                    let col = max(0, min(terminal.cols - 1, Int(location.x / colWidth)))
-                    let row = max(0, min(terminal.rows - 1, Int(location.y / rowHeight)))
-                    let button = scrollingUp ? 4 : 5
-                    let buttonFlags = terminal.encodeButton(
-                        button: button,
-                        release: false,
-                        shift: false,
-                        meta: false,
-                        control: false
-                    )
-                    for _ in 0..<extraSteps {
-                        terminal.sendEvent(
-                            buttonFlags: buttonFlags,
-                            x: col,
-                            y: row,
-                            pixelX: Int(location.x),
-                            pixelY: Int(location.y)
-                        )
-                    }
-                } else if scrollThumbsize == 0 {
-                    let key = scrollingUp
-                        ? (terminal.applicationCursor ? "\u{1b}OA" : "\u{1b}[A")
-                        : (terminal.applicationCursor ? "\u{1b}OB" : "\u{1b}[B")
-                    for _ in 0..<extraSteps {
-                        send(txt: key)
-                    }
-                } else {
-                    if scrollingUp {
-                        scrollUp(lines: extraSteps)
-                    } else {
-                        scrollDown(lines: extraSteps)
-                    }
-                }
+                applyScroll(
+                    up: velocity > 0,
+                    steps: extraSteps,
+                    twoFinger: gesture.numberOfTouches >= 2,
+                    at: gesture.location(in: self)
+                )
             }
             accumulatedScrollDelta = 0
 
@@ -1033,12 +1629,70 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             break
         }
     }
+
+    /// Finger dragging down (positive translation.y) shows earlier content.
+    private func applyScroll(up: Bool, steps: Int, twoFinger: Bool, at location: CGPoint) {
+        let magnitude = max(1, steps)
+        let terminal = getTerminal()
+        let reportsMouse = allowMouseReporting && terminal.mouseMode != .off
+        QALog.add("scroll up=\(up) steps=\(magnitude) twoFinger=\(twoFinger) mouse=\(reportsMouse) thumb=\(scrollThumbsize)")
+
+        if reportsMouse {
+            sendMouseWheel(up: up, times: twoFinger ? max(3, magnitude) : magnitude, at: location)
+            return
+        }
+        if twoFinger || scrollThumbsize == 0 {
+            let key = up ? "page_up" : "page_down"
+            if let session = attachSession, session.agentPaneID != nil {
+                session.sendKeys([key])
+            } else {
+                send(txt: up ? "\u{1b}[5~" : "\u{1b}[6~")
+            }
+            return
+        }
+
+        if reportsMouse {
+            sendMouseWheel(up: up, times: magnitude, at: location)
+            return
+        }
+        if up {
+            scrollUp(lines: magnitude)
+        } else {
+            scrollDown(lines: magnitude)
+        }
+    }
+
+    private func sendMouseWheel(up: Bool, times: Int, at location: CGPoint) {
+        let terminal = getTerminal()
+        let colWidth = max(1, bounds.width / CGFloat(max(1, terminal.cols)))
+        let rowHeight = max(12, bounds.height / CGFloat(max(1, terminal.rows)))
+        let col = max(0, min(terminal.cols - 1, Int(location.x / colWidth)))
+        let row = max(0, min(terminal.rows - 1, Int(location.y / rowHeight)))
+        let buttonFlags = terminal.encodeButton(
+            button: up ? 4 : 5,
+            release: false,
+            shift: false,
+            meta: false,
+            control: false
+        )
+        for _ in 0..<times {
+            terminal.sendEvent(
+                buttonFlags: buttonFlags,
+                x: col,
+                y: row,
+                pixelX: Int(location.x),
+                pixelY: Int(location.y)
+            )
+        }
+    }
 }
 
 /// UIKit host for SwiftTerm's iOS TerminalView, wired to the attach session.
 private struct MobileTerminalHost: UIViewRepresentable {
     let session: MobileAttachSession
     @Binding var keyboardShown: Bool
+    @Binding var ptyIsTypingTarget: Bool
+    var herdrAccessory: UIView?
 
     func makeUIView(context: Context) -> TerminalView {
         let view = MobileTerminalUIView(frame: .zero)
@@ -1047,9 +1701,26 @@ private struct MobileTerminalHost: UIViewRepresentable {
         view.nativeBackgroundColor = view.backgroundColor ?? .black
         view.nativeForegroundColor = UIColor(red: 0xD6 / 255, green: 0xD6 / 255, blue: 0xD6 / 255, alpha: 1)
         session.terminalView = view
-        if let mobile = view as? MobileTerminalUIView {
-            mobile.attachSession = session
+        let mobile = view
+        mobile.attachSession = session
+        mobile.isAgentPane = session.agentPaneID != nil
+        mobile.isPTYTypingTarget = ptyIsTypingTarget
+        mobile.herdrAccessory = herdrAccessory
+        mobile.onRequestPTYFocus = {
+            if session.agentPaneID != nil {
+                ptyIsTypingTarget = true
+                keyboardShown = false
+            } else {
+                keyboardShown = true
+            }
+            QALog.add("onRequestPTYFocus agent=\(session.agentPaneID != nil)")
         }
+        mobile.onPTYFocusEnded = {
+            if ptyIsTypingTarget {
+                ptyIsTypingTarget = false
+            }
+        }
+        mobile.applyInputChrome()
         let terminal = view.getTerminal()
         session.start(columns: terminal.cols, rows: terminal.rows)
         return view
@@ -1058,11 +1729,37 @@ private struct MobileTerminalHost: UIViewRepresentable {
     func updateUIView(_ uiView: TerminalView, context: Context) {
         if let mobile = uiView as? MobileTerminalUIView {
             mobile.attachSession = session
+            mobile.isAgentPane = session.agentPaneID != nil
+            mobile.isPTYTypingTarget = ptyIsTypingTarget
+            mobile.herdrAccessory = herdrAccessory
+            mobile.onRequestPTYFocus = {
+                if session.agentPaneID != nil {
+                    ptyIsTypingTarget = true
+                    keyboardShown = false
+                } else {
+                    keyboardShown = true
+                }
+                QALog.add("onRequestPTYFocus agent=\(session.agentPaneID != nil)")
+            }
+            mobile.onPTYFocusEnded = {
+                if ptyIsTypingTarget {
+                    ptyIsTypingTarget = false
+                }
+            }
+            mobile.applyInputChrome()
+        }
+        let isAgent = session.agentPaneID != nil
+        if isAgent {
+            if ptyIsTypingTarget,
+               !uiView.isFirstResponder,
+               (uiView as? MobileTerminalUIView)?.isSelectionOrMenuActive != true
+            {
+                _ = uiView.becomeFirstResponder()
+            }
+            return
         }
         if keyboardShown, !uiView.isFirstResponder {
             _ = uiView.becomeFirstResponder()
-        } else if !keyboardShown, uiView.isFirstResponder {
-            _ = uiView.resignFirstResponder()
         }
     }
 
@@ -1080,7 +1777,10 @@ private struct MobileTerminalHost: UIViewRepresentable {
         nonisolated func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
         nonisolated func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let bytes = Array(data)
-            Task { @MainActor in self.session.send(bytes[...]) }
+            Task { @MainActor in
+                guard self.session.agentPaneID == nil else { return }
+                self.session.send(bytes[...])
+            }
         }
         nonisolated func scrolled(source: TerminalView, position: Double) {}
         nonisolated func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}

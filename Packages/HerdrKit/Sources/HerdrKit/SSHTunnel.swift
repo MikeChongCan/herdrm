@@ -335,9 +335,12 @@ public actor SSHTunnel {
         }
         let command = """
         umask 077
-        dir="${XDG_CACHE_HOME:-$HOME/.cache}/herdrm/attachments"
+        if t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) && [ -n "$t" ]; then
+          dir="${t%/}/herdrm-attachments"
+        else
+          dir="${TMPDIR:-/tmp}/herdrm-attachments"
+        fi
         mkdir -p "$dir" && chmod 700 "$dir"
-        find "$dir" -type f -mtime +7 -delete 2>/dev/null || true
         tmp="$dir/.\(remoteFilename).part"
         dest="$dir/\(remoteFilename)"
         if cat > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$dest"; then

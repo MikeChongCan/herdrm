@@ -24,6 +24,8 @@
 	<string>public.app-category.developer-tools</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>herdrm connects to your Macs over SSH on your local network to reach the herdr session running on them.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>herdrm records your voice to turn it into a message for the agent.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

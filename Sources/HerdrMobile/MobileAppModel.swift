@@ -226,6 +226,7 @@ final class MobileAppModel {
     var selectedSpaceID: String?
     var selectedAgentPaneID: String?
     var showAddDevice = false
+    var showVoiceSettings = false
     /// Bumped by sessions to publish nested (non-Observable) state changes.
     private(set) var revision = 0
 

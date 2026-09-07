@@ -20,7 +20,9 @@ struct MobileRootView: View {
                     cwdProvider: { session.currentCwd(for: agent.paneID) },
                     target: .agent(paneID: agent.paneID),
                     paneID: agent.paneID,
-                    title: agent.title(tabLabel: model.tabLabel(for: agent))
+                    title: agent.title(tabLabel: model.tabLabel(for: agent)),
+                    draftKey: model.attachIdentity(paneID: agent.paneID),
+                    onOpenVoiceSettings: { model.showVoiceSettings = true }
                 )
                 .id(model.attachIdentity(paneID: agent.paneID))
             } else if let pane = model.selectedTerminalPane,
@@ -31,7 +33,9 @@ struct MobileRootView: View {
                     cwdProvider: { session.currentCwd(for: pane.paneID) },
                     target: .terminal(terminalID: terminalID),
                     paneID: pane.paneID,
-                    title: model.terminalLabel(for: pane)
+                    title: model.terminalLabel(for: pane),
+                    draftKey: model.attachIdentity(paneID: pane.paneID),
+                    onOpenVoiceSettings: { model.showVoiceSettings = true }
                 )
                 .id(model.attachIdentity(paneID: pane.paneID))
             } else {
@@ -44,6 +48,9 @@ struct MobileRootView: View {
         }
         .sheet(isPresented: $model.showAddDevice) {
             AddDeviceSheet(model: model)
+        }
+        .sheet(isPresented: $model.showVoiceSettings) {
+            VoiceSettingsSheet()
         }
         .task {
             if model.selectedDeviceID != nil { model.connectSelected() }
@@ -64,6 +71,7 @@ private struct SidebarListView: View {
                 } actions: {
                     Button(String(localized: "Add Device")) { model.showAddDevice = true }
                         .buttonStyle(.borderedProminent)
+                    Button(String(localized: "Settings")) { model.showVoiceSettings = true }
                 }
                 .listRowSeparator(.hidden)
             } else {
@@ -78,6 +86,15 @@ private struct SidebarListView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 DeviceSwitcherMenu(model: model)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    model.showVoiceSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel(String(localized: "Settings"))
+                .accessibilityIdentifier("settings.open")
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -290,6 +307,7 @@ private struct DeviceSwitcherMenu: View {
                     }
                 }
                 Divider()
+                Button(String(localized: "Settings")) { model.showVoiceSettings = true }
                 Button(String(localized: "Add Device…")) { model.showAddDevice = true }
                 if let selected = model.selectedDevice {
                     Button(String(localized: "Remove \(selected.name)"), role: .destructive) {

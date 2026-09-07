@@ -12,6 +12,7 @@ protocol MobileTransport: Sendable {
     func events(kinds: [String]) -> AsyncThrowingStream<HerdrEvent, Error>
     func openTerminal(command: String, columns: Int, rows: Int) async throws -> SSHPTYChannel
     func openSFTP(timeout: Duration) async throws -> SSHSFTPClient
+    func execute(_ command: String, timeout: Duration) async throws -> SSHExecResult
     /// Whether this transport can still carry an RPC. iOS suspension can leave
     /// libssh2 believing it is connected while the socket underneath is dead,
     /// so this must prove liveness on the wire rather than read a flag.
@@ -277,6 +278,10 @@ final class SSHDirectTransport: MobileTransport {
 
     func openSFTP(timeout: Duration) async throws -> SSHSFTPClient {
         try await connection.openSFTP(timeout: timeout)
+    }
+
+    func execute(_ command: String, timeout: Duration) async throws -> SSHExecResult {
+        try await connection.execute(command, timeout: timeout)
     }
 
     func close() async {

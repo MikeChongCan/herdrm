@@ -111,6 +111,8 @@ targets:
         NSLocalNetworkUsageDescription: >-
           herdrm connects to your Macs over SSH on your local network to reach
           the herdr session running on them.
+        NSMicrophoneUsageDescription: >-
+          herdrm records your voice to turn it into a message for the agent.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rockiestar.herdrm.ios

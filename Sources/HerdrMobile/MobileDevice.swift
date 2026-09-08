@@ -44,23 +44,42 @@ struct MobileDevice: Codable, Identifiable, Hashable {
 }
 
 /// Persists the device list as a versioned JSON envelope in UserDefaults.
+/// Array order is the switcher order; `defaultDeviceID` is who we open on launch.
 @MainActor
 final class MobileDeviceStore {
     private static let key = "devices.v1"
+
+    struct Snapshot {
+        var devices: [MobileDevice]
+        var defaultDeviceID: UUID?
+    }
+
     private struct Envelope: Codable {
         var version: Int
         var devices: [MobileDevice]
+        var defaultDeviceID: UUID?
     }
 
-    func load() -> [MobileDevice] {
+    func load() -> Snapshot {
         guard let data = UserDefaults.standard.data(forKey: Self.key),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data)
-        else { return [] }
-        return envelope.devices
+        else { return Snapshot(devices: [], defaultDeviceID: nil) }
+        let devices = envelope.devices
+        let defaultID = envelope.defaultDeviceID.flatMap { id in
+            devices.contains(where: { $0.id == id }) ? id : nil
+        }
+        return Snapshot(devices: devices, defaultDeviceID: defaultID)
     }
 
-    func save(_ devices: [MobileDevice]) {
-        let envelope = Envelope(version: 1, devices: devices)
+    func save(_ snapshot: Snapshot) {
+        let defaultID = snapshot.defaultDeviceID.flatMap { id in
+            snapshot.devices.contains(where: { $0.id == id }) ? id : nil
+        }
+        let envelope = Envelope(
+            version: 1,
+            devices: snapshot.devices,
+            defaultDeviceID: defaultID
+        )
         if let data = try? JSONEncoder().encode(envelope) {
             UserDefaults.standard.set(data, forKey: Self.key)
         }

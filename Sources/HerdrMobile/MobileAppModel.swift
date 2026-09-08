@@ -226,7 +226,11 @@ final class MobileAppModel {
     var selectedSpaceID: String?
     var selectedAgentPaneID: String?
     var showAddDevice = false
+    var showManageDevices = false
     var showVoiceSettings = false
+    /// Who to open when the app launches. Independent of the currently
+    /// selected (connected) device until the next cold start.
+    var defaultDeviceID: UUID?
     /// Bumped by sessions to publish nested (non-Observable) state changes.
     private(set) var revision = 0
 
@@ -234,8 +238,14 @@ final class MobileAppModel {
     private var sessions: [UUID: MobileDeviceSession] = [:]
 
     init() {
-        devices = store.load()
-        selectedDeviceID = devices.first?.id
+        let loaded = store.load()
+        devices = loaded.devices
+        defaultDeviceID = loaded.defaultDeviceID
+        selectedDeviceID = defaultDeviceID ?? devices.first?.id
+    }
+
+    var defaultDevice: MobileDevice? {
+        devices.first { $0.id == defaultDeviceID }
     }
 
     var selectedDevice: MobileDevice? {
@@ -314,7 +324,10 @@ final class MobileAppModel {
             MobileSecretStore.setPassword(password, for: device.id)
         }
         devices.append(device)
-        store.save(devices)
+        if defaultDeviceID == nil {
+            defaultDeviceID = device.id
+        }
+        persistDevices()
         selectDevice(device.id)
     }
 
@@ -330,13 +343,35 @@ final class MobileAppModel {
         MobileSecretStore.removePassword(for: device.id)
         KnownHostsStore.unpin(host: device.host, port: device.port)
         devices.removeAll { $0.id == device.id }
-        store.save(devices)
+        if defaultDeviceID == device.id {
+            defaultDeviceID = devices.first?.id
+        }
+        persistDevices()
         if selectedDeviceID == device.id {
-            selectedDeviceID = devices.first?.id
+            selectedDeviceID = defaultDeviceID ?? devices.first?.id
             selectedSpaceID = nil
             selectedAgentPaneID = nil
             connectSelected()
         }
+    }
+
+    func moveDevices(from offsets: IndexSet, to destination: Int) {
+        devices.move(fromOffsets: offsets, toOffset: destination)
+        persistDevices()
+    }
+
+    func setDefaultDevice(_ id: UUID) {
+        guard devices.contains(where: { $0.id == id }) else { return }
+        guard defaultDeviceID != id else { return }
+        defaultDeviceID = id
+        persistDevices()
+    }
+
+    private func persistDevices() {
+        store.save(MobileDeviceStore.Snapshot(
+            devices: devices,
+            defaultDeviceID: defaultDeviceID
+        ))
     }
 
     // MARK: - Derived lists (mirror the Mac sidebar)

@@ -46,8 +46,11 @@ struct MobileRootView: View {
                 )
             }
         }
-        .sheet(isPresented: $model.showAddDevice) {
+        .sheet(isPresented: addDeviceFromRoot) {
             AddDeviceSheet(model: model)
+        }
+        .sheet(isPresented: $model.showManageDevices) {
+            DeviceManagementSheet(model: model)
         }
         .sheet(isPresented: $model.showVoiceSettings) {
             VoiceSettingsSheet()
@@ -55,6 +58,15 @@ struct MobileRootView: View {
         .task {
             if model.selectedDeviceID != nil { model.connectSelected() }
         }
+    }
+
+    /// The manage sheet presents Add Device itself so we don't stack two
+    /// sheets on this view.
+    private var addDeviceFromRoot: Binding<Bool> {
+        Binding(
+            get: { model.showAddDevice && !model.showManageDevices },
+            set: { model.showAddDevice = $0 }
+        )
     }
 }
 
@@ -299,14 +311,21 @@ private struct DeviceSwitcherMenu: View {
                     Button {
                         model.selectDevice(candidate.id)
                     } label: {
-                        if candidate.id == model.selectedDeviceID {
-                            Label(candidate.name, systemImage: "checkmark")
-                        } else {
-                            Text(candidate.name)
+                        HStack {
+                            if candidate.id == model.selectedDeviceID {
+                                Label(candidate.name, systemImage: "checkmark")
+                            } else {
+                                Text(candidate.name)
+                            }
+                            if candidate.id == model.defaultDeviceID {
+                                Image(systemName: "star.fill")
+                                    .foregroundStyle(.yellow)
+                            }
                         }
                     }
                 }
                 Divider()
+                Button(String(localized: "Manage Devices…")) { model.showManageDevices = true }
                 Button(String(localized: "Settings")) { model.showVoiceSettings = true }
                 Button(String(localized: "Add Device…")) { model.showAddDevice = true }
                 if let selected = model.selectedDevice {

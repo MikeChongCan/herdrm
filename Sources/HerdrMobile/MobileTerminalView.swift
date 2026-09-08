@@ -917,9 +917,10 @@ struct MobileTerminalScreen: View {
 }
 
 /// TerminalView subclass for iOS that translates single- and two-finger touch dragging
-/// into terminal scrolling (SGR mouse wheel for mouse-tracking sessions like herdr / tmux;
-/// page keys only on the alternate screen; local SwiftTerm scrollback otherwise —
-/// Cursor agent is a normal-buffer app, not a TUI).
+/// into terminal scrolling. Agent panes are display-first: never write wheel/page
+/// bytes to the attach PTY. Cursor-style normal buffers scroll SwiftTerm locally;
+/// alternate-screen TUIs send page keys via pane.send_input. Shell panes still use
+/// SGR mouse wheel when tracking is on.
 final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
     private struct LinkHit {
         let link: DetectedLink
@@ -933,6 +934,8 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
 
     private var scrollPanGesture: UIPanGestureRecognizer?
     private var accumulatedScrollDelta: CGFloat = 0
+    /// `numberOfTouches` is 0 in `.ended`; remember two-finger from the drag.
+    private var panIsTwoFinger = false
     weak var attachSession: MobileAttachSession?
     var isAgentPane = false
     var isPTYTypingTarget = false
@@ -969,14 +972,43 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     override func insertText(_ text: String) {
         if isAgentPane {
             guard isPTYTypingTarget else { return }
-            if text == "\n" || text == "\r" || text == "\r\n" {
-                attachSession?.sendKeys(["enter"])
-            } else {
-                attachSession?.sendText(text)
-            }
+            sendAgentTyping(text)
             return
         }
         super.insertText(text)
+    }
+
+    /// Claude Code (Ink `useInput`) matches number/y/n pickers on real
+    /// keypresses. herdr's `text` path is bracketed paste, so `sendText("1")`
+    /// never selects option 1.
+    private func sendAgentTyping(_ text: String) {
+        if text == "\n" || text == "\r" || text == "\r\n" {
+            attachSession?.sendKeys(["enter"])
+            return
+        }
+        let keys = text.compactMap { Self.herdrTypingKey(for: $0) }
+        if !keys.isEmpty, keys.count == text.count {
+            attachSession?.sendKeys(keys)
+            return
+        }
+        attachSession?.sendText(text)
+    }
+
+    private static func herdrTypingKey(for character: Character) -> String? {
+        if character == "\n" || character == "\r" { return "enter" }
+        if character == "\t" { return "tab" }
+        if character.unicodeScalars.count == 1,
+           let scalar = character.unicodeScalars.first
+        {
+            if scalar.isASCII, scalar.value >= 32, scalar.value < 127 {
+                return String(character)
+            }
+            // iOS Chinese keyboards often emit fullwidth digits.
+            if scalar.value >= 0xFF10, scalar.value <= 0xFF19 {
+                return String(UnicodeScalar(UInt32(scalar.value - 0xFF10 + 48))!)
+            }
+        }
+        return nil
     }
 
     override func deleteBackward() {
@@ -1019,16 +1051,86 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         tap.delegate = self
         addGestureRecognizer(tap)
         focusTap = tap
-        if let pan = scrollPanGesture {
-            tap.require(toFail: pan)
-        }
+        preferScrollOverTaps()
     }
 
     @objc private func handleFocusTap(_ gesture: UITapGestureRecognizer) {
         guard gesture.state == .ended else { return }
         guard !isSelectionOrMenuActive else { return }
+        let location = gesture.location(in: self)
+        if isAgentPane, let key = optionKey(at: location) {
+            attachSession?.sendKeys([key])
+            QALog.add("terminal tap option=\(key)")
+        }
         QALog.add("terminal tap requestPTYFocus agent=\(isAgentPane)")
         onRequestPTYFocus?()
+    }
+
+    /// Claude Code / Ink numbered pickers listen for keypresses 1-9 (and
+    /// mouse, which we cannot inject through pane.send_input). A tap that
+    /// is not a scroll hits the visible row and sends that option's key.
+    private func optionKey(at location: CGPoint) -> String? {
+        let terminal = getTerminal()
+        let cols = max(1, terminal.cols)
+        let rows = max(1, terminal.rows)
+        let cellW = max(1, bounds.width / CGFloat(cols))
+        let cellH = max(12, bounds.height / CGFloat(rows))
+        let col = max(0, min(cols - 1, Int(location.x / cellW)))
+        let row = max(0, min(rows - 1, Int(location.y / cellH)))
+        var line = ""
+        line.reserveCapacity(cols)
+        for c in 0..<cols {
+            line.append(terminal.getCharacter(col: c, row: row) ?? " ")
+        }
+        return Self.tuiOptionKey(in: line, tappedColumn: col)
+    }
+
+    static func tuiOptionKey(in line: String, tappedColumn: Int) -> String? {
+        let chars = Array(line)
+        if tappedColumn >= 0, tappedColumn < chars.count,
+           let key = asciiOptionDigit(chars[tappedColumn]),
+           isOptionMarker(chars: chars, at: tappedColumn)
+        {
+            return key
+        }
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let start = trimmed.startIndex
+        var i = start
+        while i < trimmed.endIndex, "❯▸>●*- \t".contains(trimmed[i]) {
+            i = trimmed.index(after: i)
+        }
+        guard i < trimmed.endIndex else { return nil }
+        if trimmed[i] == "[" {
+            let next = trimmed.index(after: i)
+            guard next < trimmed.endIndex, let key = asciiOptionDigit(trimmed[next]) else { return nil }
+            let after = trimmed.index(after: next)
+            if after < trimmed.endIndex, trimmed[after] == "]" { return key }
+            return key
+        }
+        guard let key = asciiOptionDigit(trimmed[i]) else { return nil }
+        let after = trimmed.index(after: i)
+        if after == trimmed.endIndex { return key }
+        let mark = trimmed[after]
+        if ".):] \t".contains(mark) { return key }
+        return nil
+    }
+
+    private static func asciiOptionDigit(_ character: Character) -> String? {
+        if character >= "1", character <= "9" { return String(character) }
+        if let scalar = character.unicodeScalars.first,
+           scalar.value >= 0xFF11, scalar.value <= 0xFF19
+        {
+            return String(UnicodeScalar(UInt32(scalar.value - 0xFF10 + 48))!)
+        }
+        return nil
+    }
+
+    private static func isOptionMarker(chars: [Character], at index: Int) -> Bool {
+        let next = index + 1
+        if next < chars.count, ".):]".contains(chars[next]) { return true }
+        if index > 0, chars[index - 1] == "[" { return true }
+        return false
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -1543,8 +1645,16 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         gesture.maximumNumberOfTouches = 2
         addGestureRecognizer(gesture)
         self.scrollPanGesture = gesture
-        if let tap = focusTap {
-            tap.require(toFail: gesture)
+        preferScrollOverTaps()
+    }
+
+    /// SwiftTerm's 1-finger tap and the PTY-focus tap must wait for a pan to
+    /// fail, otherwise a two-finger drag is eaten as a tap / first-responder hop.
+    private func preferScrollOverTaps() {
+        guard let pan = scrollPanGesture else { return }
+        for recognizer in gestureRecognizers ?? [] {
+            guard let tap = recognizer as? UITapGestureRecognizer else { continue }
+            tap.require(toFail: pan)
         }
     }
 
@@ -1583,8 +1693,12 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         switch gesture.state {
         case .began:
             accumulatedScrollDelta = 0
+            panIsTwoFinger = gesture.numberOfTouches >= 2
 
         case .changed:
+            if gesture.numberOfTouches >= 2 {
+                panIsTwoFinger = true
+            }
             let translation = gesture.translation(in: self)
             gesture.setTranslation(.zero, in: self)
             accumulatedScrollDelta += translation.y
@@ -1592,10 +1706,11 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             let terminal = getTerminal()
             let rowHeight = max(12, bounds.height / CGFloat(max(1, terminal.rows)))
             let reportsMouse = allowMouseReporting && terminal.mouseMode != .off
+            let isAgent = attachSession?.agentPaneID != nil
 
             // In herdr and tmux, each mouse wheel event typically moves 3 rows.
             // A threshold of ~24pt gives a natural 1:1 feel under the user's thumb.
-            let threshold = reportsMouse ? max(20, rowHeight * 1.5) : max(12, rowHeight)
+            let threshold = (!isAgent && reportsMouse) ? max(20, rowHeight * 1.5) : max(12, rowHeight)
 
             if abs(accumulatedScrollDelta) >= threshold {
                 let steps = Int(accumulatedScrollDelta / threshold)
@@ -1604,7 +1719,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
                 applyScroll(
                     up: scrollingUp,
                     steps: abs(steps),
-                    twoFinger: gesture.numberOfTouches >= 2,
+                    twoFinger: panIsTwoFinger,
                     at: gesture.location(in: self)
                 )
             }
@@ -1617,14 +1732,16 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
                 applyScroll(
                     up: velocity > 0,
                     steps: extraSteps,
-                    twoFinger: gesture.numberOfTouches >= 2,
+                    twoFinger: panIsTwoFinger,
                     at: gesture.location(in: self)
                 )
             }
             accumulatedScrollDelta = 0
+            panIsTwoFinger = false
 
         case .cancelled:
             accumulatedScrollDelta = 0
+            panIsTwoFinger = false
 
         default:
             break
@@ -1636,23 +1753,34 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         let magnitude = max(1, steps)
         let terminal = getTerminal()
         let reportsMouse = allowMouseReporting && terminal.mouseMode != .off
-        QALog.add("scroll up=\(up) steps=\(magnitude) twoFinger=\(twoFinger) mouse=\(reportsMouse) thumb=\(scrollThumbsize)")
+        let isAgent = attachSession?.agentPaneID != nil
+        let alternate = scrollThumbsize == 0
+        QALog.add("scroll up=\(up) steps=\(magnitude) twoFinger=\(twoFinger) mouse=\(reportsMouse) alt=\(alternate) thumb=\(scrollThumbsize)")
+
+        // Agent attach is display-first: SGR wheel / page bytes on the PTY never
+        // reach Cursor / Claude / other agents. Two-finger used to look dead
+        // whenever mouse tracking was on. Local history (Cursor) scrolls the
+        // SwiftTerm buffer; alternate-screen TUIs get pane.send_input page keys.
+        if isAgent {
+            if !alternate {
+                let lines = twoFinger ? max(3, magnitude * 3) : magnitude
+                if up {
+                    scrollUp(lines: lines)
+                } else {
+                    scrollDown(lines: lines)
+                }
+            } else {
+                attachSession?.sendKeys([up ? "page_up" : "page_down"])
+            }
+            return
+        }
 
         if reportsMouse {
             sendMouseWheel(up: up, times: twoFinger ? max(3, magnitude) : magnitude, at: location)
             return
         }
-        // `scrollThumbsize == 0` is SwiftTerm's public signal for the
-        // alternate screen (no local history). Two-finger used to always
-        // inject page_up into the PTY, which Cursor ignores — its transcript
-        // lives in the normal buffer.
-        if scrollThumbsize == 0 {
-            let key = up ? "page_up" : "page_down"
-            if let session = attachSession, session.agentPaneID != nil {
-                session.sendKeys([key])
-            } else {
-                send(txt: up ? "\u{1b}[5~" : "\u{1b}[6~")
-            }
+        if twoFinger || alternate {
+            send(txt: up ? "\u{1b}[5~" : "\u{1b}[6~")
             return
         }
         if up {

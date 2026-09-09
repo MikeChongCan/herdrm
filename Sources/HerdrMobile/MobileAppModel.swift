@@ -228,6 +228,8 @@ final class MobileAppModel {
     var showAddDevice = false
     var showManageDevices = false
     var showVoiceSettings = false
+    var actionError: String?
+    var isCreatingTerminal = false
     /// Who to open when the app launches. Independent of the currently
     /// selected (connected) device until the next cold start.
     var defaultDeviceID: UUID?
@@ -396,6 +398,76 @@ final class MobileAppModel {
             }
             return $0.paneID < $1.paneID
         }
+    }
+
+    /// Workspace a New Terminal should land in: the selected space, else the
+    /// attached agent/pane's space, else herdr's focused space, else the first.
+    var targetWorkspaceIDForNewTerminal: String? {
+        _ = revision
+        if let selectedSpaceID { return selectedSpaceID }
+        if let agent = selectedAgent { return agent.workspaceID }
+        if let pane = selectedTerminalPane { return pane.workspaceID }
+        if let focused = selectedSession?.snapshot?.focusedWorkspaceID,
+           spaces.contains(where: { $0.workspaceID == focused })
+        {
+            return focused
+        }
+        return spaces.first?.workspaceID
+    }
+
+    var plusCreatesTerminal: Bool {
+        if case .connected = selectedConnectionState {
+            return targetWorkspaceIDForNewTerminal != nil
+        }
+        return false
+    }
+
+    func createTerminalInCurrentSpace() {
+        guard !isCreatingTerminal,
+              let workspaceID = targetWorkspaceIDForNewTerminal,
+              let session = selectedSession
+        else { return }
+        isCreatingTerminal = true
+        Task {
+            defer { isCreatingTerminal = false }
+            do {
+                let transport = try await session.currentTransport()
+                var params: [String: JSONValue] = [
+                    "focus": .bool(false),
+                    "workspace_id": .string(workspaceID),
+                ]
+                if let cwd = cwdForNewTerminal(in: workspaceID) {
+                    params["cwd"] = .string(cwd)
+                }
+                let result = try await transport.request(
+                    method: "tab.create",
+                    params: .object(params)
+                )
+                guard let paneID = result["root_pane"]?["pane_id"]?.stringValue else {
+                    throw HerdrError.malformedResponse("tab.create returned no root_pane.pane_id")
+                }
+                await session.refresh()
+                selectedSpaceID = workspaceID
+                selectedAgentPaneID = paneID
+            } catch {
+                actionError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+        }
+    }
+
+    private func cwdForNewTerminal(in workspaceID: String) -> String? {
+        if let paneID = selectedAgentPaneID,
+           let cwd = selectedSession?.currentCwd(for: paneID),
+           !cwd.isEmpty
+        {
+            return cwd
+        }
+        if let agent = agents.first(where: { $0.workspaceID == workspaceID }),
+           let cwd = agent.cwd, !cwd.isEmpty
+        {
+            return cwd
+        }
+        return nil
     }
 
     func tabLabel(for agent: AgentInfo) -> String? {

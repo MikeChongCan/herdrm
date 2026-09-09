@@ -122,6 +122,7 @@ final class VoiceDictationController {
         let leftover = takeLeftover()
         await client.disconnect()
         onStatus?(String(localized: "Tap to dictate"))
+        TranscriptionHistoryStore.append(leftover)
         return leftover
     }
 
@@ -156,6 +157,7 @@ final class VoiceDictationController {
             acceptedFinals.append(text)
             lastPartial = ""
             QALog.add("ime final \(text.count)c")
+            TranscriptionHistoryStore.append(text)
             onFinal?(text)
             if isRecording {
                 onStatus?(String(localized: "Listening…"))

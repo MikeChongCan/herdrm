@@ -6,6 +6,8 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
     var onMicToggle: (() -> Void)?
     var onMicHoldStart: (() -> Void)?
     var onMicHoldStop: (() -> Void)?
+    var onPasteTranscription: ((String) -> Void)?
+    var onShowTranscriptionHistory: (() -> Void)?
     var onSendKeys: (([String]) -> Void)?
     var onToggleKeyboard: (() -> Void)?
     var onPaste: (() -> Void)?
@@ -57,6 +59,14 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
         mic.onHoldStop = { [weak self] in
             QALog.add("toolbar mic hold stop")
             self?.onMicHoldStop?()
+        }
+        mic.onPasteTranscription = { [weak self] text in
+            QALog.add("toolbar mic paste transcription")
+            self?.onPasteTranscription?(text)
+        }
+        mic.onShowTranscriptionHistory = { [weak self] in
+            QALog.add("toolbar mic transcription history")
+            self?.onShowTranscriptionHistory?()
         }
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false

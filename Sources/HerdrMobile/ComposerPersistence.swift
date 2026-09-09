@@ -77,3 +77,56 @@ enum InputHistoryStore {
         }
     }
 }
+
+struct TranscriptionHistoryEntry: Codable, Identifiable, Hashable {
+    let id: UUID
+    let text: String
+    let createdAt: Date
+
+    init(id: UUID = UUID(), text: String, createdAt: Date = Date()) {
+        self.id = id
+        self.text = text
+        self.createdAt = createdAt
+    }
+}
+
+enum TranscriptionHistoryStore {
+    private static let defaultsKey = "voice.transcriptionHistory"
+    static let limit = 10
+
+    static func load() -> [TranscriptionHistoryEntry] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let entries = try? JSONDecoder().decode([TranscriptionHistoryEntry].self, from: data)
+        else { return [] }
+        return entries
+    }
+
+    static func recent(_ count: Int = 5) -> [TranscriptionHistoryEntry] {
+        Array(load().prefix(count))
+    }
+
+    static func append(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var entries = load()
+        if let last = entries.first, last.text == trimmed { return }
+        entries.insert(TranscriptionHistoryEntry(text: trimmed), at: 0)
+        if entries.count > limit {
+            entries = Array(entries.prefix(limit))
+        }
+        if let data = try? JSONEncoder().encode(entries) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    static func remove(_ id: UUID) {
+        let entries = load().filter { $0.id != id }
+        if let data = try? JSONEncoder().encode(entries) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+    }
+}

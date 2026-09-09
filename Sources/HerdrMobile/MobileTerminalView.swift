@@ -10,8 +10,9 @@ import UIKit
 ///
 /// Mobile terminals are display-first (Heeler's ADR 0013 insight): the live
 /// pane renders through this attach, composer prompts use `agent.prompt`, and
-/// TUI typing while the PTY has focus uses `pane.send_input`. Agent panes never
-/// write raw bytes to the attach PTY; copy/select still works.
+/// TUI typing while the PTY has focus uses `pane.send_input`. Agent panes do
+/// not write typed bytes to the attach PTY. Mouse-wheel and PageUp/PageDown
+/// CSI still go to `herdr agent attach`, which owns pane scrollback.
 @MainActor
 final class MobileAttachSession: ObservableObject {
     enum Status: Equatable {
@@ -321,6 +322,10 @@ final class MobileAttachSession: ObservableObject {
     }
 
     func pageUp() {
+        if agentPaneID != nil {
+            sendAttachCSI("\u{1b}[5~")
+            return
+        }
         if let terminalView {
             terminalView.pageUp()
         } else {
@@ -329,11 +334,20 @@ final class MobileAttachSession: ObservableObject {
     }
 
     func pageDown() {
+        if agentPaneID != nil {
+            sendAttachCSI("\u{1b}[6~")
+            return
+        }
         if let terminalView {
             terminalView.pageDown()
         } else {
             sendKeys(["page_down"])
         }
+    }
+
+    /// Bytes for `herdr agent attach` itself (wheel / PgUp), not `pane.send_input`.
+    func sendAttachCSI(_ text: String) {
+        send(ArraySlice(text.utf8))
     }
 
     func resize(columns: Int, rows: Int) {
@@ -430,6 +444,7 @@ struct MobileTerminalScreen: View {
     @State private var composerIsFirstResponder = false
     @State private var softwareKeyboardVisible = false
     @State private var showingLinks = false
+    @State private var showingTranscriptionHistory = false
     @State private var clipboardHasAttachment = MobileAttachmentStager.clipboardHasAttachment()
     @Environment(\.scenePhase) private var scenePhase
     private let title: String
@@ -555,6 +570,9 @@ struct MobileTerminalScreen: View {
         .sheet(isPresented: $showingLinks) {
             collectedLinksSheet
         }
+        .sheet(isPresented: $showingTranscriptionHistory) {
+            TranscriptionHistorySheet(onPick: pasteTranscription)
+        }
         .onChange(of: scenePhase) { _, phase in
             // The attach cannot outlive a suspension: re-prove the transport
             // and re-attach (`--takeover`) when the session behind it is gone.
@@ -657,7 +675,7 @@ struct MobileTerminalScreen: View {
         NavigationStack {
             List(session.collectedLinks, id: \.absoluteString) { url in
                 Button(url.absoluteString) {
-                    UIApplication.shared.open(url)
+                    InAppBrowser.open(url, from: session.terminalView)
                 }
                 .swipeActions(edge: .trailing) {
                     Button(String(localized: "Copy")) {
@@ -761,6 +779,8 @@ struct MobileTerminalScreen: View {
             accessory.onMicToggle = { toggleDictation() }
             accessory.onMicHoldStart = { Task { await startDictation() } }
             accessory.onMicHoldStop = { Task { await stopDictation(waitForTrailing: true) } }
+            accessory.onPasteTranscription = { pasteTranscription($0) }
+            accessory.onShowTranscriptionHistory = { showingTranscriptionHistory = true }
             accessory.onSendKeys = { keys in
                 if keys == ["page_up"] {
                     session.pageUp()
@@ -849,6 +869,19 @@ struct MobileTerminalScreen: View {
         }
     }
 
+    private func pasteTranscription(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if agentPTYIsTyping {
+            session.sendText(trimmed)
+        } else if isAgent {
+            insertComposerText(trimmed)
+            keyboardShown = true
+        } else {
+            session.terminalView?.insertText(trimmed)
+        }
+    }
+
     private func sendPrompt(submit: Bool) {
         Task { @MainActor in
             if chrome.dictation.isRecording {
@@ -917,10 +950,9 @@ struct MobileTerminalScreen: View {
 }
 
 /// TerminalView subclass for iOS that translates single- and two-finger touch dragging
-/// into terminal scrolling. Agent panes are display-first: never write wheel/page
-/// bytes to the attach PTY. Cursor-style normal buffers scroll SwiftTerm locally;
-/// alternate-screen TUIs send page keys via pane.send_input. Shell panes still use
-/// SGR mouse wheel when tracking is on.
+/// into terminal scrolling. Agent panes send wheel / page CSI to the attach
+/// PTY so `herdr agent attach` can scroll pane history or forward mouse to a
+/// TUI. Shell panes still use SGR mouse wheel when tracking is on.
 final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, UIEditMenuInteractionDelegate {
     private struct LinkHit {
         let link: DetectedLink
@@ -986,6 +1018,10 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             attachSession?.sendKeys(["enter"])
             return
         }
+        if text == " " || text == "\u{00A0}" {
+            attachSession?.sendKeys(["space"])
+            return
+        }
         let keys = text.compactMap { Self.herdrTypingKey(for: $0) }
         if !keys.isEmpty, keys.count == text.count {
             attachSession?.sendKeys(keys)
@@ -997,6 +1033,7 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     private static func herdrTypingKey(for character: Character) -> String? {
         if character == "\n" || character == "\r" { return "enter" }
         if character == "\t" { return "tab" }
+        if character == " " || character == "\u{00A0}" { return "space" }
         if character.unicodeScalars.count == 1,
            let scalar = character.unicodeScalars.first
         {
@@ -1206,6 +1243,8 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
             return "esc"
         case .keyboardTab:
             return "tab"
+        case .keyboardSpacebar:
+            return "space"
         case .keyboardF1:
             return "f1"
         case .keyboardF2:
@@ -1596,8 +1635,8 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     }
 
     private func linkMenu(for url: URL) -> UIMenu {
-        let open = UIAction(title: String(localized: "Open"), image: UIImage(systemName: "safari")) { _ in
-            UIApplication.shared.open(url)
+        let open = UIAction(title: String(localized: "Open"), image: UIImage(systemName: "safari")) { [weak self] _ in
+            InAppBrowser.open(url, from: self)
         }
         let copy = UIAction(title: String(localized: "Copy"), image: UIImage(systemName: "doc.on.doc")) { _ in
             UIPasteboard.general.string = url.absoluteString
@@ -1757,20 +1796,14 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         let alternate = scrollThumbsize == 0
         QALog.add("scroll up=\(up) steps=\(magnitude) twoFinger=\(twoFinger) mouse=\(reportsMouse) alt=\(alternate) thumb=\(scrollThumbsize)")
 
-        // Agent attach is display-first: SGR wheel / page bytes on the PTY never
-        // reach Cursor / Claude / other agents. Two-finger used to look dead
-        // whenever mouse tracking was on. Local history (Cursor) scrolls the
-        // SwiftTerm buffer; alternate-screen TUIs get pane.send_input page keys.
+        // herdr agent attach owns scrollback. Local SwiftTerm only has the
+        // painted viewport, so scrollUp is a no-op. Wheel and PgUp/PgDn CSI
+        // on the attach PTY let herdr scroll — or forward mouse to a TUI.
         if isAgent {
-            if !alternate {
-                let lines = twoFinger ? max(3, magnitude * 3) : magnitude
-                if up {
-                    scrollUp(lines: lines)
-                } else {
-                    scrollDown(lines: lines)
-                }
+            if reportsMouse {
+                sendMouseWheel(up: up, times: twoFinger ? max(3, magnitude) : magnitude, at: location)
             } else {
-                attachSession?.sendKeys([up ? "page_up" : "page_down"])
+                attachSession?.sendAttachCSI(up ? "\u{1b}[5~" : "\u{1b}[6~")
             }
             return
         }
@@ -1906,7 +1939,9 @@ private struct MobileTerminalHost: UIViewRepresentable {
         nonisolated func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let bytes = Array(data)
             Task { @MainActor in
-                guard self.session.agentPaneID == nil else { return }
+                // Agent typing uses pane.send_input. ESC sequences (SGR wheel,
+                // PgUp/PgDn) still belong on the attach PTY.
+                if self.session.agentPaneID != nil, bytes.first != 0x1b { return }
                 self.session.send(bytes[...])
             }
         }

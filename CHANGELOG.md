@@ -8,10 +8,22 @@ the Sparkle update description — a release without a section here fails CI.
 ## [Unreleased]
 
 ### Added
+- iOS: long-press the mic for recent transcriptions (context menu while idle or
+  recording; full list is a bottom sheet). Tap a row to paste into the composer
+  or the PTY.
+- iOS: the sidebar + creates a shell tab in the selected space when you are
+  already connected (`tab.create`). Add Device stays in the device menu.
 - iOS: long-press a terminal URL for the system context menu (Open / Copy / Share).
   Soft-wrapped links resolve as one URL. Attach sessions also collect http(s) links
   into a key-bar list. Taps no longer open links.
 - iOS: long-press on terminal file paths / file:// opens a read-only Quick Look snapshot over SFTP.
+
+### Fixed
+- iOS: two-finger / pan scroll on agent attach now sends wheel or PageUp/PageDown
+  to `herdr agent attach`, which owns pane scrollback. Local SwiftTerm scroll
+  could not move Cursor or Claude Code.
+- iOS: the system keyboard space bar now types into an agent PTY (`space` key
+  over `pane.send_input` instead of a rejected `" "` key name).
 
 ## [0.5.3] - 2026-08-29
 

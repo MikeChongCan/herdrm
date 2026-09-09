@@ -55,6 +55,19 @@ struct MobileRootView: View {
         .sheet(isPresented: $model.showVoiceSettings) {
             VoiceSettingsSheet()
         }
+        .alert(
+            String(localized: "Couldn’t Create Terminal"),
+            isPresented: Binding(
+                get: { model.actionError != nil },
+                set: { if !$0 { model.actionError = nil } }
+            ),
+            actions: {
+                Button(String(localized: "OK"), role: .cancel) { model.actionError = nil }
+            },
+            message: {
+                Text(model.actionError ?? "")
+            }
+        )
         .task {
             if model.selectedDeviceID != nil { model.connectSelected() }
         }
@@ -110,10 +123,21 @@ private struct SidebarListView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    model.showAddDevice = true
+                    if model.plusCreatesTerminal {
+                        model.createTerminalInCurrentSpace()
+                    } else {
+                        model.showAddDevice = true
+                    }
                 } label: {
                     Image(systemName: "plus")
                 }
+                .disabled(model.isCreatingTerminal)
+                .accessibilityLabel(
+                    model.plusCreatesTerminal
+                        ? String(localized: "New Terminal")
+                        : String(localized: "Add Device")
+                )
+                .accessibilityIdentifier("sidebar.plus")
             }
         }
         .refreshable {
@@ -179,9 +203,11 @@ private struct SidebarListView: View {
 
     @ViewBuilder
     private var terminalsSection: some View {
-        if !model.terminalPanes.isEmpty {
+        let panes = model.terminalPanes
+        let showEmptyPrompt = panes.isEmpty && model.plusCreatesTerminal
+        if !panes.isEmpty || showEmptyPrompt {
             Section(String(localized: "Terminals")) {
-                ForEach(model.terminalPanes) { pane in
+                ForEach(panes) { pane in
                     NavigationLink(value: pane.paneID) {
                         HStack(spacing: 10) {
                             Image(systemName: "terminal")
@@ -196,6 +222,15 @@ private struct SidebarListView: View {
                             }
                         }
                     }
+                }
+                if showEmptyPrompt || model.plusCreatesTerminal {
+                    Button {
+                        model.createTerminalInCurrentSpace()
+                    } label: {
+                        Label(String(localized: "New Terminal"), systemImage: "plus")
+                    }
+                    .disabled(model.isCreatingTerminal)
+                    .accessibilityIdentifier("sidebar.newTerminal")
                 }
             }
         }

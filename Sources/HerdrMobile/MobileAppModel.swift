@@ -227,6 +227,8 @@ final class MobileAppModel {
     var selectedAgentPaneID: String?
     var showAddDevice = false
     var showManageDevices = false
+    /// Existing host to edit (name, IP, port, login). Nil when no editor is up.
+    var deviceToEdit: MobileDevice?
     var showVoiceSettings = false
     var actionError: String?
     var isCreatingTerminal = false
@@ -331,6 +333,66 @@ final class MobileAppModel {
         }
         persistDevices()
         selectDevice(device.id)
+    }
+
+    /// Updates a saved host in place (same id / Keychain password). Changing
+    /// the SSH endpoint or login tears down the live session and reconnects.
+    func updateDevice(
+        id: UUID,
+        name: String,
+        host: String,
+        port: UInt16,
+        username: String,
+        authMethod: MobileDevice.AuthMethod,
+        password: String
+    ) {
+        guard let index = devices.firstIndex(where: { $0.id == id }) else { return }
+        let previous = devices[index]
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedUser = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var next = previous
+        next.name = trimmedName.isEmpty ? trimmedHost : trimmedName
+        next.host = trimmedHost
+        next.port = port
+        next.username = trimmedUser
+        next.authMethod = authMethod
+
+        let endpointChanged = previous.host != next.host || previous.port != next.port
+        let loginChanged = previous.username != next.username
+            || previous.authMethod != next.authMethod
+            || !password.isEmpty
+        if endpointChanged {
+            KnownHostsStore.unpin(host: previous.host, port: previous.port)
+        }
+        if authMethod == .password {
+            if !password.isEmpty {
+                MobileSecretStore.setPassword(password, for: id)
+            }
+        } else {
+            MobileSecretStore.removePassword(for: id)
+        }
+
+        devices[index] = next
+        persistDevices()
+
+        guard endpointChanged || loginChanged, sessions[id] != nil || selectedDeviceID == id else {
+            return
+        }
+        rebuildSession(id)
+    }
+
+    /// Drops the cached SSH session so the next connect uses the updated host.
+    private func rebuildSession(_ id: UUID) {
+        let selected = selectedDeviceID == id
+        if let session = sessions.removeValue(forKey: id) {
+            Task {
+                await session.disconnect()
+                if selected { connectSelected() }
+            }
+        } else if selected {
+            connectSelected()
+        }
     }
 
     /// The line to enroll on a Mac: `echo '<line>' >> ~/.ssh/authorized_keys`.

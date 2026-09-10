@@ -49,6 +49,9 @@ struct MobileRootView: View {
         .sheet(isPresented: addDeviceFromRoot) {
             AddDeviceSheet(model: model)
         }
+        .sheet(item: editDeviceFromRoot) { device in
+            AddDeviceSheet(model: model, existing: device)
+        }
         .sheet(isPresented: $model.showManageDevices) {
             DeviceManagementSheet(model: model)
         }
@@ -73,12 +76,19 @@ struct MobileRootView: View {
         }
     }
 
-    /// The manage sheet presents Add Device itself so we don't stack two
+    /// The manage sheet presents Add/Edit itself so we don't stack two
     /// sheets on this view.
     private var addDeviceFromRoot: Binding<Bool> {
         Binding(
             get: { model.showAddDevice && !model.showManageDevices },
             set: { model.showAddDevice = $0 }
+        )
+    }
+
+    private var editDeviceFromRoot: Binding<MobileDevice?> {
+        Binding(
+            get: { model.showManageDevices ? nil : model.deviceToEdit },
+            set: { model.deviceToEdit = $0 }
         )
     }
 }
@@ -364,6 +374,9 @@ private struct DeviceSwitcherMenu: View {
                 Button(String(localized: "Settings")) { model.showVoiceSettings = true }
                 Button(String(localized: "Add Device…")) { model.showAddDevice = true }
                 if let selected = model.selectedDevice {
+                    Button(String(localized: "Edit \(selected.name)…")) {
+                        model.deviceToEdit = selected
+                    }
                     Button(String(localized: "Remove \(selected.name)"), role: .destructive) {
                         model.removeDevice(selected)
                     }
@@ -404,6 +417,7 @@ private struct ConnectionDot: View {
 
 struct AddDeviceSheet: View {
     @Bindable var model: MobileAppModel
+    var existing: MobileDevice? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var host = ""
@@ -413,11 +427,15 @@ struct AddDeviceSheet: View {
     @State private var password = ""
     @State private var copiedKey = false
 
-    private var canAdd: Bool {
+    private var isEditing: Bool { existing != nil }
+
+    private var canSave: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty
             && !username.trimmingCharacters(in: .whitespaces).isEmpty
-            && (authMethod == .deviceKey || !password.isEmpty)
             && UInt16(port) != nil
+            && (authMethod == .deviceKey
+                || !password.isEmpty
+                || existing?.authMethod == .password)
     }
 
     var body: some View {
@@ -443,7 +461,12 @@ struct AddDeviceSheet: View {
                         Text(String(localized: "Password")).tag(MobileDevice.AuthMethod.password)
                     }
                     if authMethod == .password {
-                        SecureField(String(localized: "Password"), text: $password)
+                        SecureField(
+                            isEditing && existing?.authMethod == .password
+                                ? String(localized: "Password (leave blank to keep)")
+                                : String(localized: "Password"),
+                            text: $password
+                        )
                             .textContentType(.password)
                     }
                 }
@@ -472,27 +495,54 @@ struct AddDeviceSheet: View {
                     }
                 }
             }
-            .navigationTitle(String(localized: "Add Device"))
+            .navigationTitle(isEditing
+                ? String(localized: "Edit Device")
+                : String(localized: "Add Device"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(String(localized: "Cancel")) { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(String(localized: "Add")) {
-                        model.addDevice(
-                            name: name,
-                            host: host,
-                            port: UInt16(port) ?? 22,
-                            username: username,
-                            authMethod: authMethod,
-                            password: password
-                        )
-                        dismiss()
+                    Button(isEditing ? String(localized: "Save") : String(localized: "Add")) {
+                        save()
                     }
-                    .disabled(!canAdd)
+                    .disabled(!canSave)
                 }
             }
+            .onAppear {
+                guard let existing else { return }
+                name = existing.name
+                host = existing.host
+                port = String(existing.port)
+                username = existing.username
+                authMethod = existing.authMethod
+            }
         }
+    }
+
+    private func save() {
+        let portNumber = UInt16(port) ?? 22
+        if let existing {
+            model.updateDevice(
+                id: existing.id,
+                name: name,
+                host: host,
+                port: portNumber,
+                username: username,
+                authMethod: authMethod,
+                password: password
+            )
+        } else {
+            model.addDevice(
+                name: name,
+                host: host,
+                port: portNumber,
+                username: username,
+                authMethod: authMethod,
+                password: password
+            )
+        }
+        dismiss()
     }
 }

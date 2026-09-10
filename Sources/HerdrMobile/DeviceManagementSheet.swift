@@ -16,7 +16,8 @@ struct DeviceManagementSheet: View {
                             device: device,
                             isDefault: device.id == model.defaultDeviceID,
                             isSelected: device.id == model.selectedDeviceID,
-                            onSetDefault: { model.setDefaultDevice(device.id) }
+                            onSetDefault: { model.setDefaultDevice(device.id) },
+                            onEdit: { model.deviceToEdit = device }
                         )
                     }
                     .onMove(perform: model.moveDevices)
@@ -26,7 +27,7 @@ struct DeviceManagementSheet: View {
                         }
                     }
                 } footer: {
-                    Text(String(localized: "Drag to change the order in the device menu. The starred Mac is selected when the app opens."))
+                    Text(String(localized: "Drag to change the order in the device menu. The starred Mac is selected when the app opens. Pencil edits name, IP, and SSH login."))
                 }
             }
             .environment(\.editMode, .constant(.active))
@@ -45,6 +46,9 @@ struct DeviceManagementSheet: View {
         .sheet(isPresented: $model.showAddDevice) {
             AddDeviceSheet(model: model)
         }
+        .sheet(item: $model.deviceToEdit) { device in
+            AddDeviceSheet(model: model, existing: device)
+        }
     }
 }
 
@@ -53,6 +57,7 @@ private struct DeviceManageRow: View {
     let isDefault: Bool
     let isSelected: Bool
     let onSetDefault: () -> Void
+    let onEdit: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -75,6 +80,13 @@ private struct DeviceManageRow: View {
                     .lineLimit(1)
             }
             Spacer()
+            Button(action: onEdit) {
+                Image(systemName: "pencil")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(String(localized: "Edit \(device.name)"))
+            .accessibilityIdentifier("devices.edit.\(device.id.uuidString)")
             Button(action: onSetDefault) {
                 Image(systemName: isDefault ? "star.fill" : "star")
                     .foregroundStyle(isDefault ? Color.yellow : .secondary)

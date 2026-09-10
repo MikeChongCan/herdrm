@@ -21,6 +21,8 @@ the Sparkle update description — a release without a section here fails CI.
   and shell panes now draw with libghostty-vt so the client matches herdr's
   pane engine. SwiftTerm remains as a fallback. iOS stays SwiftTerm until
   the same Ghostty path can host UITextInput.
+- iOS: edit an existing remote host (name, IP, port, login) from Manage
+  Devices or the device menu. Changing the SSH target reconnects that device.
 
 ### Fixed
 - iOS: two-finger / pan scroll on agent attach now sends wheel or PageUp/PageDown

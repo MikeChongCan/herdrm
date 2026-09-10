@@ -1,5 +1,7 @@
 import AppKit
+import Darwin
 import HerdrKit
+import HerdrTerminal
 import SwiftTerm
 import SwiftUI
 import UniformTypeIdentifiers
@@ -677,7 +679,7 @@ final class LineBreakTerminalView: LocalProcessTerminalView {
 
 /// Puts the keyboard in a specific terminal, one runloop pass later so it lands after
 /// AppKit has finished its own first-responder bookkeeping for the current event.
-func focusTerminal(_ view: LocalProcessTerminalView?) {
+func focusTerminal(_ view: NSView?) {
     DispatchQueue.main.async {
         guard let view, let window = view.window else { return }
         window.makeFirstResponder(view)
@@ -702,13 +704,23 @@ func focusRemainingTerminal() {
 }
 
 private extension NSView {
-    func firstTerminalDescendant() -> LocalProcessTerminalView? {
-        if let terminal = self as? LocalProcessTerminalView { return terminal }
+    func firstTerminalDescendant() -> NSView? {
+        if self is LocalProcessTerminalView || self is GhosttyTerminalView { return self }
         for subview in subviews {
             if let found = subview.firstTerminalDescendant() { return found }
         }
         return nil
     }
+}
+
+private func herdrProcessEnvironment(from command: TerminalCommand) -> [String] {
+    var environment = Terminal.getEnvironmentVariables(termName: "xterm-256color")
+    environment.append("LANG=en_US.UTF-8")
+    for (key, value) in command.environment {
+        environment.removeAll { $0.hasPrefix("\(key)=") }
+        environment.append("\(key)=\(value)")
+    }
+    return environment
 }
 
 /// Embeds a SwiftTerm terminal running a direct agent or ordinary-terminal attach
@@ -742,33 +754,46 @@ struct AttachTerminalView: NSViewRepresentable {
     var onExit: ((Int32?) -> Void)? = nil
     /// Delivers the created view so a focus tracker can observe its window's
     /// first responder without retaining the terminal itself.
-    var onViewReady: ((LocalProcessTerminalView) -> Void)? = nil
+    var onViewReady: ((NSView) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
-        let view = LineBreakTerminalView(frame: .zero)
-        configurePasteHandling(view)
-        view.processDelegate = context.coordinator
-        context.coordinator.onExit = onExit
-        configureAppearance(view)
-
+    func makeNSView(context: Context) -> NSView {
         let service = HerdrService(device: device)
-        view.attachmentService = service
         let command = service.attachCommand(target: target, serverVersion: serverVersion)
-        var environment = Terminal.getEnvironmentVariables(termName: "xterm-256color")
-        environment.append("LANG=en_US.UTF-8")
-        for (key, value) in command.environment {
-            environment.removeAll { $0.hasPrefix("\(key)=") }
-            environment.append("\(key)=\(value)")
-        }
+        let environment = herdrProcessEnvironment(from: command)
         context.coordinator.authorizationID = command.authorizationID
         context.coordinator.scheduleAuthorizationCleanup()
-        view.startProcess(
-            executable: command.executable,
-            args: command.args,
-            environment: environment
-        )
+        context.coordinator.onExit = onExit
+
+        let view: NSView
+        switch TerminalEngineKind.current {
+        case .ghostty:
+            let ghostty = GhosttyTerminalView(frame: .zero)
+            ghostty.onExit = { [weak coordinator = context.coordinator] code in
+                coordinator?.reportProcessExit(exitCode: code)
+            }
+            applyGhosttyAppearance(ghostty)
+            ghostty.startProcess(
+                executable: command.executable,
+                args: command.args,
+                environment: environment
+            )
+            view = ghostty
+        case .swiftterm:
+            let swiftTerm = LineBreakTerminalView(frame: .zero)
+            configurePasteHandling(swiftTerm)
+            swiftTerm.processDelegate = context.coordinator
+            configureAppearance(swiftTerm)
+            swiftTerm.attachmentService = service
+            swiftTerm.startProcess(
+                executable: command.executable,
+                args: command.args,
+                environment: environment
+            )
+            view = swiftTerm
+        }
+
         // SwiftUI throws this view away and builds a new one whenever the selected
         // agent changes (the `.id("attach-…")` in ContentView), and a fresh NSView is
         // never first responder — so keystrokes went nowhere until the user clicked.
@@ -782,12 +807,14 @@ struct AttachTerminalView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onExit = onExit
         if let view = nsView as? LineBreakTerminalView {
             configurePasteHandling(view)
+            configureAppearance(view)
+        } else if let view = nsView as? GhosttyTerminalView {
+            applyGhosttyAppearance(view)
         }
-        context.coordinator.onExit = onExit
-        configureAppearance(nsView)
     }
 
     /// Re-applied on update because capabilities can arrive after the terminal
@@ -799,10 +826,14 @@ struct AttachTerminalView: NSViewRepresentable {
         view.onAttachmentUploadingChanged = onAttachmentUploadingChanged
     }
 
-    static func dismantleNSView(_ nsView: LocalProcessTerminalView, coordinator: Coordinator) {
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         // A view being torn down must not report its own terminate() as an exit.
         coordinator.onExit = nil
-        nsView.terminate()
+        if let view = nsView as? LocalProcessTerminalView {
+            view.terminate()
+        } else if let view = nsView as? GhosttyTerminalView {
+            view.terminate()
+        }
     }
 
     private func configureAppearance(_ view: LocalProcessTerminalView) {
@@ -813,6 +844,15 @@ struct AttachTerminalView: NSViewRepresentable {
             thinStrokes: thinStrokes,
             fontWeight: fontWeight,
             lineSpacing: lineSpacing,
+            dark: dark,
+            mouseReporting: mouseReporting
+        )
+    }
+
+    private func applyGhosttyAppearance(_ view: GhosttyTerminalView) {
+        view.applyAppearance(
+            font: TerminalDefaults.font(name: fontName, size: fontSize, weight: fontWeight),
+            lineSpacing: CGFloat(lineSpacing),
             dark: dark,
             mouseReporting: mouseReporting
         )
@@ -838,14 +878,18 @@ struct AttachTerminalView: NSViewRepresentable {
             self.authorizationID = nil
         }
 
-        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-        func processTerminated(source: TerminalView, exitCode: Int32?) {
+        func reportProcessExit(exitCode: Int32?) {
             discardAuthorization()
             let callback = onExit
             onExit = nil  // report once
             DispatchQueue.main.async { callback?(exitCode) }
+        }
+
+        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func processTerminated(source: TerminalView, exitCode: Int32?) {
+            reportProcessExit(exitCode: exitCode)
         }
     }
 }
@@ -889,10 +933,10 @@ func applyTerminalAppearance(
 /// one uses the registry to restore keyboard focus.
 @MainActor
 enum ShellViewRegistry {
-    private struct WeakView { weak var view: LocalProcessTerminalView? }
+    private struct WeakView { weak var view: NSView? }
     private static var views: [UUID: WeakView] = [:]
 
-    static func register(_ view: LocalProcessTerminalView, for id: UUID) {
+    static func register(_ view: NSView, for id: UUID) {
         views[id] = WeakView(view: view)
     }
 
@@ -922,41 +966,54 @@ struct ShellTerminalView: NSViewRepresentable {
     var onExit: ((Int32?) -> Void)? = nil
     /// Delivers the created view so a focus tracker can observe its window's
     /// first responder without retaining the terminal itself.
-    var onViewReady: ((LocalProcessTerminalView) -> Void)? = nil
+    var onViewReady: ((NSView) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
-        let view = LineBreakTerminalView(frame: .zero)
-        view.processDelegate = context.coordinator
-        context.coordinator.onExit = onExit
-        context.coordinator.sessionID = sessionID
-        applyTerminalAppearance(
-            view,
-            fontName: fontName,
-            fontSize: fontSize,
-            thinStrokes: thinStrokes,
-            fontWeight: fontWeight,
-            lineSpacing: lineSpacing,
-            dark: dark,
-            mouseReporting: mouseReporting
-        )
-
+    func makeNSView(context: Context) -> NSView {
         let command = HerdrService(device: device, autoStartLocalServer: false)
             .terminalCommand()
-        var environment = Terminal.getEnvironmentVariables(termName: "xterm-256color")
-        environment.append("LANG=en_US.UTF-8")
-        for (key, value) in command.environment {
-            environment.removeAll { $0.hasPrefix("\(key)=") }
-            environment.append("\(key)=\(value)")
-        }
+        let environment = herdrProcessEnvironment(from: command)
+        context.coordinator.onExit = onExit
+        context.coordinator.sessionID = sessionID
         context.coordinator.authorizationID = command.authorizationID
         context.coordinator.scheduleAuthorizationCleanup()
-        view.startProcess(
-            executable: command.executable,
-            args: command.args,
-            environment: environment
-        )
+
+        let view: NSView
+        switch TerminalEngineKind.current {
+        case .ghostty:
+            let ghostty = GhosttyTerminalView(frame: .zero)
+            ghostty.onExit = { [weak coordinator = context.coordinator] code in
+                coordinator?.reportProcessExit(exitCode: code)
+            }
+            applyGhosttyAppearance(ghostty)
+            ghostty.startProcess(
+                executable: command.executable,
+                args: command.args,
+                environment: environment
+            )
+            view = ghostty
+        case .swiftterm:
+            let swiftTerm = LineBreakTerminalView(frame: .zero)
+            swiftTerm.processDelegate = context.coordinator
+            applyTerminalAppearance(
+                swiftTerm,
+                fontName: fontName,
+                fontSize: fontSize,
+                thinStrokes: thinStrokes,
+                fontWeight: fontWeight,
+                lineSpacing: lineSpacing,
+                dark: dark,
+                mouseReporting: mouseReporting
+            )
+            swiftTerm.startProcess(
+                executable: command.executable,
+                args: command.args,
+                environment: environment
+            )
+            view = swiftTerm
+        }
+
         if let sessionID {
             ShellViewRegistry.register(view, for: sessionID)
         }
@@ -972,43 +1029,60 @@ struct ShellTerminalView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: LocalProcessTerminalView, context: Context) {
+    func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.onExit = onExit
-        applyTerminalAppearance(
-            nsView,
-            fontName: fontName,
-            fontSize: fontSize,
-            thinStrokes: thinStrokes,
-            fontWeight: fontWeight,
-            lineSpacing: lineSpacing,
-            dark: dark,
-            mouseReporting: mouseReporting
-        )
+        if let view = nsView as? LocalProcessTerminalView {
+            applyTerminalAppearance(
+                view,
+                fontName: fontName,
+                fontSize: fontSize,
+                thinStrokes: thinStrokes,
+                fontWeight: fontWeight,
+                lineSpacing: lineSpacing,
+                dark: dark,
+                mouseReporting: mouseReporting
+            )
+        } else if let view = nsView as? GhosttyTerminalView {
+            applyGhosttyAppearance(view)
+        }
     }
 
-    static func dismantleNSView(_ nsView: LocalProcessTerminalView, coordinator: Coordinator) {
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.onExit = nil
         coordinator.discardAuthorization()
         if let sessionID = coordinator.sessionID {
             ShellViewRegistry.unregister(sessionID)
         }
-        let shellPid = nsView.process?.shellPid ?? 0
-        nsView.terminate()
-        // terminate() sends SIGTERM, which interactive shells ignore — a closed
-        // split left a live orphaned zsh, not the expected zombie. SIGHUP is the
-        // "terminal went away" signal shells exit on; reap it, escalating to
-        // SIGKILL if something (a stuck foreground job) holds the shell up.
-        guard shellPid > 0 else { return }
-        kill(shellPid, SIGHUP)
-        DispatchQueue.global(qos: .utility).async {
-            var status: Int32 = 0
-            for _ in 0..<20 {
-                if waitpid(shellPid, &status, WNOHANG) != 0 { return }
-                usleep(100_000)
+        if let view = nsView as? LocalProcessTerminalView {
+            let shellPid = view.process?.shellPid ?? 0
+            view.terminate()
+            // terminate() sends SIGTERM, which interactive shells ignore — a closed
+            // split left a live orphaned zsh, not the expected zombie. SIGHUP is the
+            // "terminal went away" signal shells exit on; reap it, escalating to
+            // SIGKILL if something (a stuck foreground job) holds the shell up.
+            guard shellPid > 0 else { return }
+            kill(shellPid, SIGHUP)
+            DispatchQueue.global(qos: .utility).async {
+                var status: Int32 = 0
+                for _ in 0..<20 {
+                    if waitpid(shellPid, &status, WNOHANG) != 0 { return }
+                    usleep(100_000)
+                }
+                kill(shellPid, SIGKILL)
+                waitpid(shellPid, &status, 0)
             }
-            kill(shellPid, SIGKILL)
-            waitpid(shellPid, &status, 0)
+        } else if let view = nsView as? GhosttyTerminalView {
+            view.terminate()
         }
+    }
+
+    private func applyGhosttyAppearance(_ view: GhosttyTerminalView) {
+        view.applyAppearance(
+            font: TerminalDefaults.font(name: fontName, size: fontSize, weight: fontWeight),
+            lineSpacing: CGFloat(lineSpacing),
+            dark: dark,
+            mouseReporting: mouseReporting
+        )
     }
 
     final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
@@ -1032,14 +1106,18 @@ struct ShellTerminalView: NSViewRepresentable {
             self.authorizationID = nil
         }
 
-        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
-        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-        func processTerminated(source: TerminalView, exitCode: Int32?) {
+        func reportProcessExit(exitCode: Int32?) {
             discardAuthorization()
             let callback = onExit
             onExit = nil  // report once
             DispatchQueue.main.async { callback?(exitCode) }
+        }
+
+        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
+        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func processTerminated(source: TerminalView, exitCode: Int32?) {
+            reportProcessExit(exitCode: exitCode)
         }
     }
 }

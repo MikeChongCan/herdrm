@@ -17,6 +17,10 @@ the Sparkle update description — a release without a section here fails CI.
   Soft-wrapped links resolve as one URL. Attach sessions also collect http(s) links
   into a key-bar list. Taps no longer open links.
 - iOS: long-press on terminal file paths / file:// opens a read-only Quick Look snapshot over SFTP.
+- macOS: Settings → Terminal can pick Ghostty (default) or SwiftTerm. Attach
+  and shell panes now draw with libghostty-vt so the client matches herdr's
+  pane engine. SwiftTerm remains as a fallback. iOS stays SwiftTerm until
+  the same Ghostty path can host UITextInput.
 
 ### Fixed
 - iOS: two-finger / pan scroll on agent attach now sends wheel or PageUp/PageDown

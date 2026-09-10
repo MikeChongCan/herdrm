@@ -1,5 +1,4 @@
 import AppKit
-import SwiftTerm
 import SwiftUI
 
 /// A two-pane split with a draggable divider and a persisted ratio. `axis == nil` shows
@@ -106,8 +105,8 @@ private enum SplitContainerRatioBounds {
 }
 
 /// Tracks which side of the ⌘D split holds the keyboard by KVO-observing the key
-/// window's `firstResponder`. `LocalProcessTerminalView`'s responder methods are
-/// `public override`, not `open`, so they cannot be subclassed.
+/// window's `firstResponder`. SwiftTerm's responder methods are `public override`,
+/// not `open`, so they cannot be subclassed; Ghostty's view is a plain NSView.
 ///
 /// `NSWindow.firstResponder` is documented as KVO-observable. `NSApplication.keyWindow`
 /// is NOT documented as such, but was verified empirically to fire — including on the
@@ -126,8 +125,8 @@ final class SplitFocusTracker {
     /// change, even when the value repeats — see the note above.
     var onSideChanged: ((SplitSide) -> Void)?
 
-    weak var agentView: LocalProcessTerminalView?
-    weak var shellView: LocalProcessTerminalView?
+    weak var agentView: NSView?
+    weak var shellView: NSView?
 
     private var keyWindowObservation: NSKeyValueObservation?
     private var firstResponderObservation: NSKeyValueObservation?

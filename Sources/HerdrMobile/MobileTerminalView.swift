@@ -7,6 +7,8 @@ import UIKit
 /// One live attach: a PTY channel running `herdr … attach` on the device,
 /// pumped into a SwiftTerm view. The session outlives view updates; it ends
 /// when the channel EOFs (takeover by another client, pane closed, network).
+/// macOS already draws this attach with libghostty-vt (herdr's pane engine);
+/// iOS stays on SwiftTerm until a Ghostty + UITextInput host lands.
 ///
 /// Mobile terminals are display-first (Heeler's ADR 0013 insight): the live
 /// pane renders through this attach, composer prompts use `agent.prompt`, and

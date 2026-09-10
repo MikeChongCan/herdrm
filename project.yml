@@ -13,6 +13,8 @@ packages:
     path: Packages/HerdrKit
   HerdrSSH:
     path: Packages/HerdrSSH
+  HerdrTerminal:
+    path: Packages/HerdrTerminal
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     # 1.19 ships the marked-text overlay used for IME preedit; do not reimplement it.
@@ -34,6 +36,7 @@ targets:
       - path: Resources/Localizable.xcstrings
     dependencies:
       - package: HerdrKit
+      - package: HerdrTerminal
       - package: SwiftTerm
       - package: Sparkle
     info:

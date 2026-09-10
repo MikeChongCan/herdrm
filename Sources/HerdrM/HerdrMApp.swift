@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import HerdrKit
+import HerdrTerminal
 import Sparkle
 import SwiftTerm
 import SwiftUI
@@ -319,12 +320,20 @@ struct TerminalSettingsView: View {
     @AppStorage(TerminalDefaults.fontWeightKey) private var fontWeight = TerminalDefaults.defaultFontWeight
     @AppStorage(TerminalDefaults.lineSpacingKey) private var lineSpacing = TerminalDefaults.defaultLineSpacing
     @AppStorage("terminal.mouseReporting") private var mouseReporting = true
+    @AppStorage(TerminalEngineKind.defaultsKey) private var engine = TerminalEngineKind.ghostty.rawValue
 
     private let families = TerminalDefaults.monospacedFamilies()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Form {
+                Picker("Engine", selection: $engine) {
+                    ForEach(TerminalEngineKind.allCases) { kind in
+                        Text(kind.settingsLabel).tag(kind.rawValue)
+                    }
+                }
+                .help("Ghostty matches herdr's pane VT. SwiftTerm stays as a fallback.")
+
                 Picker("Font", selection: $fontName) {
                     Text("System Mono (SF Mono)").tag("")
                     Divider()
@@ -394,6 +403,7 @@ struct TerminalSettingsView: View {
                     lineSpacing = TerminalDefaults.defaultLineSpacing
                     thinStrokes = true
                     mouseReporting = true
+                    engine = TerminalEngineKind.ghostty.rawValue
                 }
             }
 

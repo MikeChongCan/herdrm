@@ -19,13 +19,21 @@ Design canvas (waku-style sidebar, light/dark): `design/` — published as the
   arm64 xcframeworks (`Artifacts/PROVENANCE.md`), ported from Heeler's
   HeelerSSH. `SSHConnection` does `direct-streamlocal` to the remote herdr
   socket (one channel per RPC), PTY exec channels for terminal attach.
-- `Sources/HerdrM` — macOS SwiftUI app (XcodeGen `project.yml`), SwiftTerm embed.
+- `Packages/HerdrTerminal` — SPM library: official `ghostty-vt.xcframework`
+  plus a CoreText `GhosttyTerminalView` and PTY. Provenance in
+  `Artifacts/PROVENANCE.md`. Default macOS engine; SwiftTerm stays as a
+  Settings fallback. Do not rebuild Ghostty with Zig in this repo.
+- `Sources/HerdrM` — macOS SwiftUI app (XcodeGen `project.yml`). Default
+  attach/shell pane is Ghostty (`herdr agent attach` / `terminal attach`
+  unchanged). Settings can switch back to SwiftTerm.
 - `Sources/HerdrMobile` — iOS/iPadOS SwiftUI app (`HerdrMobile` target, iOS 18,
   iPhone + iPad). Devices are SSH hosts (Ed25519 device key in Keychain or
   password; TOFU host keys); RPC over `HerdrSSH`; terminal = display-first PTY
   attach behind an APC bootstrap marker + native composer (`agent.prompt`) +
-  key bar (`pane.send_input` keys). No relay yet — that lands as a second
-  `MobileTransport` implementation.
+  key bar (`pane.send_input` keys). Still SwiftTerm — when iOS moves off it,
+  use the same Ghostty VT path as macOS/herdr (UITextInput later), not a
+  second emulator. No relay yet — that lands as a second `MobileTransport`
+  implementation.
 - `design/` — design canvas working files (`*.dc.html` artboards + `canvas.json`).
 
 ## Build & test

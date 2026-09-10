@@ -1,4 +1,5 @@
 import HerdrKit
+import HerdrTerminal
 import SwiftUI
 
 struct RootView: View {
@@ -276,6 +277,7 @@ struct DetailView: View {
     @AppStorage(TerminalDefaults.fontWeightKey) private var terminalFontWeight = TerminalDefaults.defaultFontWeight
     @AppStorage(TerminalDefaults.lineSpacingKey) private var terminalLineSpacing = TerminalDefaults.defaultLineSpacing
     @AppStorage("terminal.mouseReporting") private var terminalMouseReporting = true
+    @AppStorage(TerminalEngineKind.defaultsKey) private var terminalEngine = TerminalEngineKind.ghostty.rawValue
     @Environment(\.colorScheme) private var colorScheme
     /// The entry whose attach process exited, and how. Keyed by entry id so a stale
     /// exit from a previously selected pane never covers a live terminal.
@@ -305,7 +307,7 @@ struct DetailView: View {
                     mouseReporting: terminalMouseReporting,
                     onExit: { _ in model.closeShellSession(session.id) }
                 )
-                    .id("shell-\(session.id)")
+                    .id("shell-\(session.id)-\(terminalEngine)")
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
                     .opacity(model.selectedShellID == session.id ? 1 : 0)
@@ -354,7 +356,7 @@ struct DetailView: View {
                             model.splitAgentView = $0
                         }
                     )
-                        .id("attach-\(entry.id)-\(colorScheme)-\(attachRetry)")
+                        .id("attach-\(entry.id)-\(colorScheme)-\(attachRetry)-\(terminalEngine)")
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
                     if endedAttachKey == entry.id {
@@ -380,7 +382,7 @@ struct DetailView: View {
                     // a new id tears the view down and kills the shell with whatever
                     // was running in it, and unlike a herdr pane a local shell has no
                     // server-side state to reattach to. updateNSView re-themes it.
-                    .id("shell")
+                    .id("shell-\(terminalEngine)")
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
             }

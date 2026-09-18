@@ -555,6 +555,9 @@ struct MobileTerminalScreen: View {
             if isAgent, terminalFR, !ptyIsTypingTarget {
                 return
             }
+            // Accessory-only / leftover willShow after resign: keep compact
+            // visible and do not treat a ghost keyboard as the typing chrome.
+            guard keyboardTargetRequested || typingTargetIsFirstResponder else { return }
             softwareKeyboardVisible = true
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
@@ -598,8 +601,12 @@ struct MobileTerminalScreen: View {
         isAgent && (keyboardShown || (chrome.isRecording && !agentPTYIsTyping) || !composerText.isEmpty)
     }
 
+    /// Hide the in-layout bar as soon as we intend to type, not after
+    /// `keyboardWillShow`. Waiting on the notification left compact + the
+    /// keyboard `inputAccessoryView` stacked for ~100ms (and after dismiss,
+    /// a leftover willShow could stack them again).
     private var hideCompactRow: Bool {
-        softwareKeyboardVisible && typingTargetIsFirstResponder
+        keyboardTargetRequested || (softwareKeyboardVisible && typingTargetIsFirstResponder)
     }
 
     private var agentPTYIsTyping: Bool {
@@ -991,14 +998,20 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     }()
 
     func applyInputChrome() {
+        let nextAccessory: UIView?
+        let nextInput: UIView?
         if isAgentPane {
-            inputAccessoryView = isPTYTypingTarget ? herdrAccessory : nil
-            inputView = isFirstResponder && !isPTYTypingTarget ? Self.dummyKeyboard : nil
+            nextAccessory = isPTYTypingTarget ? herdrAccessory : nil
+            nextInput = isFirstResponder && !isPTYTypingTarget ? Self.dummyKeyboard : nil
         } else {
-            inputAccessoryView = herdrAccessory
-            inputView = nil
+            nextAccessory = herdrAccessory
+            nextInput = nil
         }
-        if isFirstResponder {
+        let accessoryChanged = inputAccessoryView !== nextAccessory
+        let inputChanged = inputView !== nextInput
+        inputAccessoryView = nextAccessory
+        inputView = nextInput
+        if isFirstResponder, accessoryChanged || inputChanged {
             reloadInputViews()
         }
     }
@@ -1006,6 +1019,10 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     override func insertText(_ text: String) {
         if isAgentPane {
             guard isPTYTypingTarget else { return }
+            sendAgentTyping(text)
+            return
+        }
+        if let bar = herdrAccessory as? HerdrInputAccessory, bar.hasLatchedModifiers {
             sendAgentTyping(text)
             return
         }
@@ -1017,19 +1034,29 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     /// never selects option 1.
     private func sendAgentTyping(_ text: String) {
         if text == "\n" || text == "\r" || text == "\r\n" {
-            attachSession?.sendKeys(["enter"])
+            attachSession?.sendKeys([chorded("enter")])
             return
         }
         if text == " " || text == "\u{00A0}" {
-            attachSession?.sendKeys(["space"])
+            attachSession?.sendKeys([chorded("space")])
             return
         }
         let keys = text.compactMap { Self.herdrTypingKey(for: $0) }
         if !keys.isEmpty, keys.count == text.count {
-            attachSession?.sendKeys(keys)
+            attachSession?.sendKeys(keys.map { chorded($0) })
+            return
+        }
+        if let bar = herdrAccessory as? HerdrInputAccessory, bar.hasLatchedModifiers,
+           let first = keys.first {
+            attachSession?.sendKeys([chorded(first)])
             return
         }
         attachSession?.sendText(text)
+        (herdrAccessory as? HerdrInputAccessory)?.clearOneShotModifiers()
+    }
+
+    private func chorded(_ key: String, extra: [String] = []) -> String {
+        (herdrAccessory as? HerdrInputAccessory)?.chorded(key, extra: extra) ?? key
     }
 
     private static func herdrTypingKey(for character: Character) -> String? {
@@ -1053,7 +1080,11 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     override func deleteBackward() {
         if isAgentPane {
             guard isPTYTypingTarget else { return }
-            attachSession?.sendKeys(["backspace"])
+            attachSession?.sendKeys([chorded("backspace")])
+            return
+        }
+        if let bar = herdrAccessory as? HerdrInputAccessory, bar.hasLatchedModifiers {
+            attachSession?.sendKeys([chorded("backspace")])
             return
         }
         super.deleteBackward()
@@ -1196,7 +1227,9 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        guard isAgentPane, isPTYTypingTarget else {
+        let bar = herdrAccessory as? HerdrInputAccessory
+        let intercept = (isAgentPane && isPTYTypingTarget) || bar?.hasLatchedModifiers == true
+        guard intercept else {
             super.pressesBegan(presses, with: event)
             return
         }
@@ -1204,20 +1237,22 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         var unhandled: Set<UIPress> = []
         for press in presses {
             guard let key = press.key,
-                  !key.modifierFlags.contains(.command),
-                  let namedKey = Self.herdrKey(for: key)
+                  let namedKey = Self.herdrKey(
+                    for: key,
+                    includePrintable: bar?.hasLatchedModifiers == true
+                  )
             else {
                 unhandled.insert(press)
                 continue
             }
-            attachSession?.sendKeys([namedKey])
+            attachSession?.sendKeys([chorded(namedKey, extra: Self.herdrModifiers(for: key))])
         }
         if !unhandled.isEmpty {
             super.pressesBegan(unhandled, with: event)
         }
     }
 
-    private static func herdrKey(for key: UIKey) -> String? {
+    private static func herdrKey(for key: UIKey, includePrintable: Bool = false) -> String? {
         switch key.keyCode {
         case .keyboardReturnOrEnter:
             return "enter"
@@ -1268,14 +1303,30 @@ final class MobileTerminalUIView: TerminalView, UIGestureRecognizerDelegate, UIC
         case .keyboardF10:
             return "f10"
         default:
-            guard key.modifierFlags.contains(.control) else { return nil }
+            let flags = key.modifierFlags
+            let hardwareChord = flags.contains(.control)
+                || flags.contains(.alternate)
+                || flags.contains(.command)
+            guard includePrintable || hardwareChord else { return nil }
             let character = key.charactersIgnoringModifiers.lowercased()
             guard character.utf8.count == 1,
                   let scalar = character.unicodeScalars.first,
-                  scalar.isASCII, scalar.properties.isAlphabetic
+                  scalar.isASCII,
+                  scalar.value >= 32,
+                  scalar.value < 127
             else { return nil }
-            return "ctrl+\(character)"
+            return String(character)
         }
+    }
+
+    private static func herdrModifiers(for key: UIKey) -> [String] {
+        var mods: [String] = []
+        let flags = key.modifierFlags
+        if flags.contains(.control) { mods.append("ctrl") }
+        if flags.contains(.alternate) { mods.append("alt") }
+        if flags.contains(.shift) { mods.append("shift") }
+        if flags.contains(.command) { mods.append("cmd") }
+        return mods
     }
 
     var isSelectionOrMenuActive: Bool {

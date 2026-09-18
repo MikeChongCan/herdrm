@@ -263,6 +263,15 @@ final class VoiceComposerTextView: UITextView {
     }
 
     override func paste(_ sender: Any?) {
+        // Voice IMEs insert by writing the clipboard and calling paste:. Prefer
+        // that text so a leftover screenshot / PNG preview is not uploaded.
+        if let text = UIPasteboard.general.string,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            insertText(text)
+            republishUnmarked()
+            return
+        }
         if MobileAttachmentStager.clipboardHasAttachment() {
             onPasteAttachments?()
             return

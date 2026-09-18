@@ -23,13 +23,22 @@ the Sparkle update description — a release without a section here fails CI.
   the same Ghostty path can host UITextInput.
 - iOS: edit an existing remote host (name, IP, port, login) from Manage
   Devices or the device menu. Changing the SSH target reconnects that device.
+- iOS: the terminal key bar has Control, Option, and Command. Tap a modifier
+  for the next key (ctrl+c, ⌘d); long-press locks it like Shift. Dedicated
+  ^C/^D chips are gone. Keys play a keyboard-like haptic on press.
 
 ### Fixed
+- iOS: composer paste prefers clipboard text, so a voice IME that inserts via
+  `paste:` no longer uploads a leftover screenshot or PNG preview as an
+  attachment. The screenshot button still stages an image when you tap it.
 - iOS: two-finger / pan scroll on agent attach now sends wheel or PageUp/PageDown
   to `herdr agent attach`, which owns pane scrollback. Local SwiftTerm scroll
   could not move Cursor or Claude Code.
 - iOS: the system keyboard space bar now types into an agent PTY (`space` key
   over `pane.send_input` instead of a rejected `" "` key name).
+- iOS: the key toolbar no longer flashes a second copy when the keyboard
+  opens or closes. Compact row hides as soon as typing is requested, and
+  leftover `keyboardWillShow` after resign is ignored.
 
 ## [0.5.3] - 2026-08-29
 

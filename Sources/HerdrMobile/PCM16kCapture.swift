@@ -12,8 +12,15 @@ final class PCM16kCapture {
         self.onChunk = onChunk
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+        // Mix/duck so Podcasts and Apple Music are not interrupted. `.measurement`
+        // is exclusive and was pausing other audio for the whole session.
+        try session.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.mixWithOthers, .duckOthers, .defaultToSpeaker, .allowBluetoothHFP]
+        )
         try session.setActive(true)
+        QALog.add("audio session playAndRecord mix+duck")
 
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
@@ -43,6 +50,8 @@ final class PCM16kCapture {
         engine.inputNode.removeTap(onBus: 0)
         converter = nil
         onChunk = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        QALog.add("audio session released")
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer, target: AVAudioFormat) {

@@ -23,6 +23,46 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
     private var pasteButton: UIButton!
     private var logButton: UIButton!
     private var statusWidthConstraint: NSLayoutConstraint!
+    private var modifierButtons: [Modifier: UIButton] = [:]
+    private var modifierLatch: [Modifier: Latch] = [
+        .ctrl: .off, .alt: .off, .cmd: .off,
+    ]
+    /// Long-press already locked the modifier; ignore the following tap.
+    private var suppressModifierTap: Set<Modifier> = []
+    /// Keyboard-like tap; prepared so the first press is not delayed.
+    private let keyHaptic = UIImpactFeedbackGenerator(style: .soft)
+
+    private enum Modifier: String, CaseIterable {
+        case ctrl
+        case alt
+        case cmd
+
+        static let barOrder: [Modifier] = [.ctrl, .alt, .cmd]
+
+        var barTitle: String {
+            switch self {
+            case .ctrl: return "ctrl"
+            case .alt: return "⌥"
+            case .cmd: return "⌘"
+            }
+        }
+
+        var accessibilityName: String {
+            switch self {
+            case .ctrl: return String(localized: "Control")
+            case .alt: return String(localized: "Option")
+            case .cmd: return String(localized: "Command")
+            }
+        }
+    }
+
+    private enum Latch {
+        case off
+        case once
+        case locked
+
+        var isActive: Bool { self != .off }
+    }
 
     static var barHeight: CGFloat {
         UIDevice.current.userInterfaceIdiom == .phone ? 44 : 48
@@ -36,6 +76,7 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
         )
         allowsSelfSizing = true
         backgroundColor = UIColor(white: 0.12, alpha: 1)
+        keyHaptic.prepare()
 
         keyboardButton.translatesAutoresizingMaskIntoConstraints = false
         Self.styleIconButton(keyboardButton, highlighted: false)
@@ -44,7 +85,7 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
             QALog.add("toolbar keyboard toggle")
             self?.onToggleKeyboard?()
         }, for: .touchUpInside)
-        Self.attachPressFade(keyboardButton)
+        attachPressFade(keyboardButton)
         setKeyboardVisible(false)
 
         mic.translatesAutoresizingMaskIntoConstraints = false
@@ -92,16 +133,11 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
         let items: [(title: String, symbol: String?, key: String)] = [
             ("esc", nil, "esc"),
             ("tab", nil, "tab"),
-            ("ctrl", nil, "ctrl"),
+            ("⏎", nil, "enter"),
             ("", "chevron.up", "up"),
             ("", "chevron.down", "down"),
             ("", "chevron.left", "left"),
             ("", "chevron.right", "right"),
-            ("⏎", nil, "enter"),
-            ("^C", nil, "ctrl+c"),
-            ("^D", nil, "ctrl+d"),
-            ("^Z", nil, "ctrl+z"),
-            ("^L", nil, "ctrl+l"),
             ("⇞", nil, "page_up"),
             ("⇟", nil, "page_down"),
             ("Hom", nil, "home"),
@@ -121,14 +157,20 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
             ("F9", nil, "f9"),
             ("F10", nil, "f10"),
         ]
+        for modifier in Modifier.barOrder {
+            let button = Self.makeKey(title: modifier.barTitle, symbol: nil)
+            button.accessibilityIdentifier = "chrome.mod.\(modifier.rawValue)"
+            installModifier(modifier, on: button)
+            keys.addArrangedSubview(button)
+        }
         for item in items {
             let button = Self.makeKey(title: item.title, symbol: item.symbol)
             let key = item.key
             button.addAction(UIAction { [weak self] _ in
                 QALog.add("toolbar key \(key)")
-                self?.onSendKeys?([key])
+                self?.sendKey(key)
             }, for: .touchUpInside)
-            Self.attachPressFade(button)
+            attachPressFade(button)
             keys.addArrangedSubview(button)
         }
 
@@ -138,7 +180,7 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
             QALog.add("toolbar paste")
             self?.onPaste?()
         }, for: .touchUpInside)
-        Self.attachPressFade(pasteButton)
+        attachPressFade(pasteButton)
         keys.addArrangedSubview(pasteButton)
 
         logButton = Self.makeIconButton("ladybug.fill", identifier: "chrome.shareLogs")
@@ -147,7 +189,7 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
             QALog.add("toolbar attach logs")
             self?.onShareLogs?()
         }, for: .touchUpInside)
-        Self.attachPressFade(logButton)
+        attachPressFade(logButton)
         keys.addArrangedSubview(logButton)
 
         leftFade.translatesAutoresizingMaskIntoConstraints = false
@@ -250,6 +292,123 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
             : String(localized: "Show Keyboard")
     }
 
+    /// Prefix a named herdr key with latched toolbar modifiers, then consume
+    /// one-shot latches. Hardware modifiers in `extra` stay for this chord.
+    func chorded(_ key: String, extra: [String] = []) -> String {
+        var mods: [String] = []
+        for modifier in Modifier.barOrder where modifierLatch[modifier]?.isActive == true {
+            mods.append(modifier.rawValue)
+        }
+        for name in extra where !mods.contains(name) {
+            mods.append(name)
+        }
+        let order = ["ctrl", "alt", "shift", "cmd"]
+        mods.sort {
+            (order.firstIndex(of: $0) ?? 99) < (order.firstIndex(of: $1) ?? 99)
+        }
+        consumeOneShotLatches()
+        var base = key
+        if !mods.isEmpty, key.count == 1, key.first?.isLetter == true {
+            base = key.lowercased()
+        }
+        guard !mods.isEmpty else { return base }
+        return (mods + [base]).joined(separator: "+")
+    }
+
+    func clearOneShotModifiers() {
+        consumeOneShotLatches()
+    }
+
+    var hasLatchedModifiers: Bool {
+        modifierLatch.values.contains { $0.isActive }
+    }
+
+    private func sendKey(_ key: String) {
+        onSendKeys?([chorded(key)])
+    }
+
+    private func playKeyHaptic(intensity: CGFloat = 0.85) {
+        keyHaptic.impactOccurred(intensity: intensity)
+        keyHaptic.prepare()
+    }
+
+    private func installModifier(_ modifier: Modifier, on button: UIButton) {
+        modifierButtons[modifier] = button
+        button.accessibilityLabel = modifier.accessibilityName
+        button.addAction(UIAction { [weak self] _ in
+            self?.handleModifierTap(modifier)
+        }, for: .touchUpInside)
+        attachPressFade(button)
+        let press = UILongPressGestureRecognizer(
+            target: self,
+            action: #selector(handleModifierLongPress(_:))
+        )
+        press.minimumPressDuration = 0.45
+        button.addGestureRecognizer(press)
+        refreshModifierAppearance(modifier)
+    }
+
+    @objc private func handleModifierLongPress(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began,
+              let button = recognizer.view as? UIButton,
+              let modifier = modifierButtons.first(where: { $0.value === button })?.key
+        else { return }
+        suppressModifierTap.insert(modifier)
+        modifierLatch[modifier] = .locked
+        QALog.add("toolbar \(modifier.rawValue) lock")
+        playKeyHaptic(intensity: 1)
+        refreshModifierAppearance(modifier)
+    }
+
+    private func handleModifierTap(_ modifier: Modifier) {
+        if suppressModifierTap.remove(modifier) != nil { return }
+        switch modifierLatch[modifier] {
+        case .off, .none:
+            modifierLatch[modifier] = .once
+            QALog.add("toolbar \(modifier.rawValue) once")
+        case .once, .locked:
+            modifierLatch[modifier] = .off
+            QALog.add("toolbar \(modifier.rawValue) off")
+        }
+        refreshModifierAppearance(modifier)
+    }
+
+    private func consumeOneShotLatches() {
+        var changed: [Modifier] = []
+        for modifier in Modifier.barOrder where modifierLatch[modifier] == .once {
+            modifierLatch[modifier] = .off
+            changed.append(modifier)
+        }
+        for modifier in changed {
+            refreshModifierAppearance(modifier)
+        }
+    }
+
+    private func refreshModifierAppearance(_ modifier: Modifier) {
+        guard let button = modifierButtons[modifier] else { return }
+        let latch = modifierLatch[modifier] ?? .off
+        let fill: CGFloat
+        switch latch {
+        case .off: fill = 0.08
+        case .once: fill = 0.22
+        case .locked: fill = 0.40
+        }
+        button.backgroundColor = UIColor.white.withAlphaComponent(fill)
+        if latch == .locked {
+            button.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.55)
+        }
+        let suffix: String
+        switch latch {
+        case .off: suffix = ""
+        case .once: suffix = String(localized: ", once")
+        case .locked: suffix = String(localized: ", locked")
+        }
+        button.accessibilityLabel = modifier.accessibilityName + suffix
+        button.accessibilityValue = latch == .locked
+            ? String(localized: "Locked")
+            : (latch == .once ? String(localized: "Once") : nil)
+    }
+
     private static func makeKey(title: String, symbol: String?) -> UIButton {
         let button = UIButton(type: .system)
         if let symbol {
@@ -295,8 +454,9 @@ final class HerdrInputAccessory: UIInputView, UIScrollViewDelegate {
         button.layer.cornerRadius = 8
     }
 
-    private static func attachPressFade(_ button: UIButton) {
-        button.addAction(UIAction { _ in
+    private func attachPressFade(_ button: UIButton) {
+        button.addAction(UIAction { [weak self] _ in
+            self?.playKeyHaptic()
             UIView.animate(withDuration: 0.08) { button.alpha = 0.4 }
         }, for: .touchDown)
         button.addAction(UIAction { _ in

@@ -32,7 +32,10 @@ enum MobileAttachmentStager {
 
     @MainActor
     static func clipboardHasAttachment(_ pasteboard: UIPasteboard = .general) -> Bool {
-        pasteboard.hasImages || fileURLs(in: pasteboard).isEmpty == false
+        if fileURLs(in: pasteboard).isEmpty == false { return true }
+        // `hasImages` is true for IME / HTML copies that only attach a PNG
+        // preview next to text. Those are not screenshots.
+        return pasteboard.hasImages && !pasteboard.hasStrings
     }
 
     @MainActor

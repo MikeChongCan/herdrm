@@ -5,6 +5,8 @@
 # `xcodegen generate` (the Makefile does it for you). Never commit it.
 HerdrM.xcodeproj/
 # Written at build time from project.yml.
+Packages/HerdrKit/.build/
+Packages/HerdrSSH/.build/
 Sources/HerdrM/Info.plist
 
 # ---------------------------------------------------------------------------

@@ -426,6 +426,12 @@ private enum TimedProcess {
         ))
         posix_spawnattr_setflags(&attr, flags)
 
+        // Disclaim herdrm's TCC responsibility for this probe: it runs the user's
+        // `.zshrc` / `.zprofile`, which routinely touch other apps' data (version
+        // managers, history sync, plugin managers), and those accesses should not
+        // prompt as herdrm. See `ResponsibilityDisclaim` (issue #87).
+        ResponsibilityDisclaim.apply(to: &attr)
+
         var empty = sigset_t()
         sigemptyset(&empty)
         posix_spawnattr_setsigmask(&attr, &empty)

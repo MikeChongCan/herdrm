@@ -1,9 +1,7 @@
 import AppKit
 import Darwin
 import HerdrKit
-import HerdrTerminal
 import Sparkle
-import SwiftTerm
 import SwiftUI
 import UserNotifications
 
@@ -276,6 +274,7 @@ struct AgentsSettingsView: View {
         ("kimi", "Kimi", "kimi"),
         ("opencode", "OpenCode", "opencode"),
         ("pi", "Pi", "pi"),
+        ("omp", "Oh My Pi", "omp"),
         ("copilot", "Copilot", "copilot"),
     ]
 
@@ -320,20 +319,15 @@ struct TerminalSettingsView: View {
     @AppStorage(TerminalDefaults.fontWeightKey) private var fontWeight = TerminalDefaults.defaultFontWeight
     @AppStorage(TerminalDefaults.lineSpacingKey) private var lineSpacing = TerminalDefaults.defaultLineSpacing
     @AppStorage("terminal.mouseReporting") private var mouseReporting = true
-    @AppStorage(TerminalEngineKind.defaultsKey) private var engine = TerminalEngineKind.ghostty.rawValue
+
+    @State private var importMessage: String?
+    @State private var importSucceeded = false
 
     private let families = TerminalDefaults.monospacedFamilies()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Form {
-                Picker("Engine", selection: $engine) {
-                    ForEach(TerminalEngineKind.allCases) { kind in
-                        Text(kind.settingsLabel).tag(kind.rawValue)
-                    }
-                }
-                .help("Ghostty matches herdr's pane VT. SwiftTerm stays as a fallback.")
-
                 Picker("Font", selection: $fontName) {
                     Text("System Mono (SF Mono)").tag("")
                     Divider()
@@ -396,14 +390,25 @@ struct TerminalSettingsView: View {
                     }
                 }
 
-                Button("Reset to Defaults") {
-                    fontName = ""
-                    fontSize = TerminalDefaults.defaultFontSize
-                    fontWeight = TerminalDefaults.defaultFontWeight
-                    lineSpacing = TerminalDefaults.defaultLineSpacing
-                    thinStrokes = true
-                    mouseReporting = true
-                    engine = TerminalEngineKind.ghostty.rawValue
+                HStack(spacing: 10) {
+                    Button("Reset to Defaults") {
+                        fontName = ""
+                        fontSize = TerminalDefaults.defaultFontSize
+                        fontWeight = TerminalDefaults.defaultFontWeight
+                        lineSpacing = TerminalDefaults.defaultLineSpacing
+                        thinStrokes = true
+                        mouseReporting = true
+                        importMessage = nil
+                    }
+                    Button("Import from Ghostty…") { importFromGhostty() }
+                        .help("Reads font-family and font-size from ~/.config/ghostty/config. A one-time copy — herdrm's settings stay in charge afterward.")
+                }
+
+                if let importMessage {
+                    Text(importMessage)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(importSucceeded ? Color.secondary : Color.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -422,6 +427,58 @@ struct TerminalSettingsView: View {
             }
         }
         .padding(20)
+    }
+
+    /// One-time import of the terminal font from `~/.config/ghostty/config`, so a
+    /// Ghostty user isn't jarred by a different face (#73). Only the family and
+    /// size are copied; herdrm's settings own everything from then on.
+    private func importFromGhostty() {
+        guard let config = GhosttyConfigImporter.load() else {
+            importSucceeded = false
+            importMessage = String(
+                localized: "ghostty.import.none",
+                defaultValue: "No Ghostty config found at ~/.config/ghostty/config."
+            )
+            return
+        }
+        var applied: [String] = []
+        var skipped: [String] = []
+
+        if let family = config.fontFamily {
+            let normalized = family.lowercased().replacingOccurrences(of: " ", with: "")
+            if normalized == "sfmono" || normalized == "sfmono-regular" {
+                // macOS doesn't expose SF Mono as a pickable family; it is
+                // herdrm's built-in default (the empty selection).
+                fontName = ""
+                applied.append("font System Mono (SF Mono)")
+            } else if let resolved = TerminalDefaults.resolveFamily(family) {
+                fontName = resolved
+                applied.append("font \(resolved)")
+            } else {
+                skipped.append("font “\(family)” isn't installed")
+            }
+        }
+        if let size = config.fontSize {
+            let clamped = min(max(size, 9), 22)
+            fontSize = clamped
+            applied.append(String(format: "size %.1f pt", clamped))
+        }
+
+        if applied.isEmpty && skipped.isEmpty {
+            importSucceeded = false
+            importMessage = String(
+                localized: "ghostty.import.empty",
+                defaultValue: "Ghostty config has no font settings to import."
+            )
+        } else if applied.isEmpty {
+            importSucceeded = false
+            importMessage = "Couldn't import: " + skipped.joined(separator: "; ") + "."
+        } else {
+            importSucceeded = true
+            var message = "Imported " + applied.joined(separator: ", ")
+            if !skipped.isEmpty { message += " (skipped: " + skipped.joined(separator: "; ") + ")" }
+            importMessage = message + "."
+        }
     }
 }
 

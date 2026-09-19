@@ -1,6 +1,6 @@
 import Foundation
 
-/// Agent status buckets as reported by herdr (protocol 19).
+/// Agent status buckets reported by herdr snapshots and status events.
 public enum AgentStatus: String, Codable, Sendable, CaseIterable {
     case idle
     case working
@@ -47,6 +47,24 @@ public struct AgentInfo: Codable, Sendable, Identifiable, Equatable {
     public var agent: String { agentKindRaw ?? "agent" }
     /// Sidebar / titlebar label without a tab label. Prefer `title(tabLabel:)`.
     public var title: String { title(tabLabel: nil) }
+
+    public func updatingStatus(_ status: AgentStatus) -> AgentInfo {
+        AgentInfo(
+            terminalID: terminalID,
+            agentKindRaw: agentKindRaw,
+            name: name,
+            customTitle: customTitle,
+            terminalTitle: terminalTitle,
+            terminalTitleStripped: terminalTitleStripped,
+            agentStatusRaw: status.rawValue,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            paneID: paneID,
+            focused: focused,
+            cwd: cwd,
+            revision: revision
+        )
+    }
 
     /// Sidebar / titlebar label.
     ///
@@ -213,10 +231,13 @@ public struct TabInfo: Codable, Sendable, Identifiable, Equatable {
 
     /// herdr labels fresh tabs with their number ("1", "2"); only a label
     /// someone actually set is a display name.
+    ///
+    /// After `tab.move`, `number` and `label` can desync (`number=1`,
+    /// `label="2"`). Any all-digit label is still a default, not a name.
     public var customLabel: String? {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        if let number, trimmed == String(number) { return nil }
+        if trimmed.allSatisfy(\.isNumber) { return nil }
         return trimmed
     }
 
@@ -251,6 +272,24 @@ public struct SessionSnapshot: Codable, Sendable, Equatable {
         }
     }
 
+    public func updatingAgentStatus(paneID: String, status: AgentStatus) -> SessionSnapshot? {
+        var agents = agents
+        guard let index = agents.firstIndex(where: { $0.paneID == paneID }) else {
+            return nil
+        }
+        agents[index] = agents[index].updatingStatus(status)
+        return SessionSnapshot(
+            agents: agents,
+            workspaces: workspaces,
+            tabs: tabs,
+            panes: panes,
+            focusedPaneID: focusedPaneID,
+            focusedWorkspaceID: focusedWorkspaceID,
+            version: version,
+            protocolVersion: protocolVersion
+        )
+    }
+
     enum CodingKeys: String, CodingKey {
         case agents
         case workspaces
@@ -282,10 +321,12 @@ public struct HerdrEvent: Sendable {
         self.payload = payload
     }
 
-    /// All parameterless (globally subscribable) kinds in herdr protocol 19.
-    /// pane.agent_status_changed / pane.scroll_changed / pane.output_matched are
-    /// pane-scoped (require pane_id) and are deliberately absent; status changes
-    /// surface globally via pane.updated.
+    public static let subscriptionStartedKind = "subscription.started"
+    public static let agentStatusChangedKind = "pane.agent_status_changed"
+
+    /// All parameterless (globally subscribable) lifecycle kinds.
+    /// `pane.agent_status_changed` is pane-scoped and appended separately for
+    /// each known pane by `SocketRPC.events`.
     public static let allKinds: [String] = [
         "workspace.created", "workspace.updated", "workspace.metadata_updated", "workspace.renamed",
         "workspace.moved", "workspace.reordered", "workspace.focused", "workspace.closed",
@@ -295,6 +336,23 @@ public struct HerdrEvent: Sendable {
         "pane.agent_detected",
         "layout.updated",
     ]
+
+    private static let scopedKinds = [
+        agentStatusChangedKind,
+        "pane.scroll_changed",
+        "pane.output_matched",
+    ]
+
+    private static let normalizedKinds = Dictionary(
+        (allKinds + scopedKinds).map {
+            ($0.replacingOccurrences(of: ".", with: "_"), $0)
+        },
+        uniquingKeysWith: { first, _ in first }
+    )
+
+    static func normalizedKind(_ wireKind: String) -> String {
+        normalizedKinds[wireKind] ?? wireKind
+    }
 }
 
 public enum HerdrError: Error, LocalizedError, Sendable {
@@ -308,6 +366,8 @@ public enum HerdrError: Error, LocalizedError, Sendable {
     case tunnelFailed(String)
     case fileOperationFailed(String)
     case fileTransferFailed(String)
+    case tailcatTokenMissing
+    case tailcatBridgeFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -322,6 +382,8 @@ public enum HerdrError: Error, LocalizedError, Sendable {
         case .tunnelFailed(let reason): return "SSH tunnel failed: \(reason)"
         case .fileOperationFailed(let reason): return "file operation failed: \(reason)"
         case .fileTransferFailed(let reason): return "file transfer failed: \(reason)"
+        case .tailcatTokenMissing: return "no tailcat token saved for this device"
+        case .tailcatBridgeFailed(let reason): return "tailcat tunnel failed: \(reason)"
         }
     }
 }

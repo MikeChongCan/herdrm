@@ -133,28 +133,24 @@ public struct LocalHerdrServer: Sendable {
         let logURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("herdrm-herdr-server-\(getpid())-\(UUID().uuidString.prefix(8)).log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        guard let log = try? FileHandle(forWritingTo: logURL) else {
-            throw HerdrError.connectionFailed("could not open \(logURL.path)")
-        }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: binary)
-        proc.arguments = ["server"]
         // Same PATH the lookup walked, plus the binary's directory last: herdr
         // itself is a real Mach-O, but panes and `#!/usr/bin/env node` shims
         // still need node / bun / NVM_DIR from the captured block.
         let base = environment ?? (ShellEnvironment.cached ?? .empty).launchEnvironment(binary: binary)
-        proc.environment = serverEnvironment(base: base)
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = log
-        proc.standardError = log
-        do {
-            try proc.run()
-        } catch {
-            throw HerdrError.connectionFailed("herdr server spawn: \(error.localizedDescription)")
+        // posix_spawn (not Foundation `Process`) so the daemon can be disclaimed
+        // of herdrm's TCC responsibility — otherwise the server and every agent
+        // it runs prompt for file access *as herdrm* (issue #87). See
+        // `ResponsibilityDisclaim`.
+        guard let pid = DetachedSpawn.run(
+            executable: binary,
+            arguments: ["server"],
+            environment: serverEnvironment(base: base),
+            logPath: logURL.path
+        ) else {
+            throw HerdrError.connectionFailed("herdr server spawn failed for \(binary)")
         }
-        let watched = ProcessBox(proc)
         return Launched(
-            isRunning: { watched.process.isRunning },
+            isRunning: { !DetachedSpawn.hasExited(pid) },
             output: {
                 let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
                 return String(text.trimmingCharacters(in: .whitespacesAndNewlines).suffix(2_000))
@@ -211,16 +207,6 @@ public struct LocalHerdrServer: Sendable {
         guard let fd = try? SocketRPC.connect(path: path) else { return false }
         close(fd)
         return true
-    }
-}
-
-/// Lets the observation closures be `@Sendable` around a `Process`, which isn't.
-/// Safe because the wrapped process is only ever read (`isRunning`), never mutated.
-private final class ProcessBox: @unchecked Sendable {
-    let process: Process
-
-    init(_ process: Process) {
-        self.process = process
     }
 }
 #endif  // os(macOS)

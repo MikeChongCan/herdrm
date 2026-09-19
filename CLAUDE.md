@@ -19,21 +19,19 @@ Design canvas (waku-style sidebar, light/dark): `design/` — published as the
   arm64 xcframeworks (`Artifacts/PROVENANCE.md`), ported from Heeler's
   HeelerSSH. `SSHConnection` does `direct-streamlocal` to the remote herdr
   socket (one channel per RPC), PTY exec channels for terminal attach.
-- `Packages/HerdrTerminal` — SPM library: official `ghostty-vt.xcframework`
-  plus a CoreText `GhosttyTerminalView` and PTY. Provenance in
-  `Artifacts/PROVENANCE.md`. Default macOS engine; SwiftTerm stays as a
-  Settings fallback. Do not rebuild Ghostty with Zig in this repo.
-- `Sources/HerdrM` — macOS SwiftUI app (XcodeGen `project.yml`). Default
-  attach/shell pane is Ghostty (`herdr agent attach` / `terminal attach`
-  unchanged). Settings can switch back to SwiftTerm.
+- `Sources/HerdrM` — macOS SwiftUI app (XcodeGen `project.yml`). The terminal is
+  libghostty (`GhosttyTerminal` product of Lakr233/libghostty-spm, Metal): each
+  pane is a host-managed `InMemoryTerminalSession` fed by `TerminalProcess`, a
+  local `forkpty` byte pump. `LineBreakTerminalView` subclasses ghostty's
+  `AppTerminalView` and keeps herdrm's own behavior (light-mode ANSI adapter,
+  ⌘-editing-key readline chords via `session.sendInput`, agent-aware paste).
 - `Sources/HerdrMobile` — iOS/iPadOS SwiftUI app (`HerdrMobile` target, iOS 18,
   iPhone + iPad). Devices are SSH hosts (Ed25519 device key in Keychain or
-  password; TOFU host keys); RPC over `HerdrSSH`; terminal = display-first PTY
-  attach behind an APC bootstrap marker + native composer (`agent.prompt`) +
-  key bar (`pane.send_input` keys). Still SwiftTerm — when iOS moves off it,
-  use the same Ghostty VT path as macOS/herdr (UITextInput later), not a
-  second emulator. No relay yet — that lands as a second `MobileTransport`
-  implementation.
+  password; TOFU host keys) or tailcat control-plane tunnels; RPC over
+  `HerdrSSH` / the embedded tailcat bridge. Terminal attach is still SwiftTerm
+  (composer + key bar + `pane.send_input`); when iOS moves off it, use the
+  same Ghostty VT path as macOS (`UITextInput` later), not a second emulator.
+  Tailcat on iOS is control-plane only — no PTY attach.
 - `design/` — design canvas working files (`*.dc.html` artboards + `canvas.json`).
 
 ## Build & test
@@ -43,10 +41,13 @@ make build      # xcodegen + xcodebuild → build/Build/Products/Debug/HerdrM.ap
 make run
 make kit-test   # HerdrKit integration tests (need a running local herdr)
 HERDRM_E2E_SSH_TARGET=vincent@10.10.10.87 make kit-test   # + remote SSH E2E
+make mobile-build  # HerdrMobile + HerdrSSH compile (arm64 Simulator)
+make ssh-test      # HerdrSSH Swift Testing on iOS Simulator
 ```
 
-xcodebuild needs `-skipPackagePluginValidation` (SwiftTerm ships a build plugin);
-the Makefile passes it.
+xcodebuild needs `-skipPackagePluginValidation`; the Makefile passes it. Building
+against Xcode 27 needs the Metal toolchain component (libghostty compiles a Metal
+shader): `xcodebuild -downloadComponent MetalToolchain` once.
 
 ## Release
 
@@ -63,15 +64,16 @@ release notes and the Sparkle update description, and fails if it's missing —
 add the section before tagging. The cask in OwO-Network/homebrew-brew is
 auto-bumped after each release.
 
-## herdr protocol notes (0.8.0, protocol 19; verified against the live socket)
+## herdr protocol notes (0.9.0, private protocol 22; verified against the live socket)
 
 - Requests are NDJSON `{"id","method","params"}` on `~/.config/herdr/herdr.sock`;
   `params` must be present even when empty (`{}`), or the server rejects the request.
 - `tab.create` returns the new pane as `result.root_pane.pane_id`.
-- `events.subscribe` takes `{"subscriptions":[{"type":"pane.updated"},…]}`;
-  `pane.agent_status_changed` / `pane.scroll_changed` / `pane.output_matched` are
-  pane-scoped (require `pane_id`) and cannot be subscribed globally — status changes
-  arrive globally as `pane.updated`. Full global kind list: `HerdrEvent.allKinds`.
+- `events.subscribe` takes `{"subscriptions":[{"type":"pane.updated"},…]}`.
+  `pane.agent_status_changed` is pane-scoped and must be subscribed with `pane_id`;
+  status transitions do not emit `pane.updated`. HerdrM appends one scoped status
+  subscription for every known pane and re-subscribes when pane topology changes.
+  `pane.scroll_changed` / `pane.output_matched` are scoped too.
 - Terminal attach: agents use `herdr agent attach <pane_id> --takeover`; bare shells use
   `herdr terminal attach <terminal_id> --takeover` (takes the pane over from other attached
   clients). Remote devices run it through `ssh -tt` with PATH prepended

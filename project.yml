@@ -13,8 +13,14 @@ packages:
     path: Packages/HerdrKit
   HerdrSSH:
     path: Packages/HerdrSSH
-  HerdrTerminal:
-    path: Packages/HerdrTerminal
+  HerdrTailcat:
+    path: Packages/HerdrTailcat
+  GhosttyTerminal:
+    url: https://github.com/Lakr233/libghostty-spm
+    # Prebuilt libghostty xcframework — pin exactly and review the checksum diff
+    # on every bump (supply-chain discipline for a binary dependency). The
+    # version scheme is <major.minor>.<UTC yyyymmdd>, so `from:` would drift.
+    exactVersion: "1.6.20260909"
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     # 1.19 ships the marked-text overlay used for IME preedit; do not reimplement it.
@@ -22,6 +28,11 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     from: "2.9.6"
+  StickySectionHeaders:
+    # Sidebar section headers (pin + cover + scroll-linked fade). Pinned to a
+    # release tag; bump deliberately.
+    url: https://github.com/jt-wang/StickySectionHeaders
+    exactVersion: "1.0.0"
 targets:
   HerdrM:
     type: application
@@ -36,9 +47,12 @@ targets:
       - path: Resources/Localizable.xcstrings
     dependencies:
       - package: HerdrKit
-      - package: HerdrTerminal
-      - package: SwiftTerm
+      - package: HerdrTailcat
+        product: HerdrTailcat
+      - package: GhosttyTerminal
+        product: GhosttyTerminal
       - package: Sparkle
+      - package: StickySectionHeaders
     info:
       path: Sources/HerdrM/Info.plist
       properties:
@@ -92,6 +106,8 @@ targets:
     dependencies:
       - package: HerdrKit
       - package: HerdrSSH
+      - package: HerdrTailcat
+        product: HerdrTailcat
       - package: SwiftTerm
     info:
       path: Sources/HerdrMobile/Info.plist
@@ -133,3 +149,33 @@ targets:
         ARCHS: arm64
         ONLY_ACTIVE_ARCH: NO
         EXCLUDED_ARCHS__sdk_iphonesimulator__: x86_64
+  HerdrMTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/HerdrMTests
+    dependencies:
+      - target: HerdrM
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.bybee.herdrm.tests
+        GENERATE_INFOPLIST_FILE: YES
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_VERSION: "5.10"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/herdrm.app/Contents/MacOS/herdrm"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+
+schemes:
+  HerdrM:
+    build:
+      targets:
+        HerdrM: all
+        HerdrMTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HerdrMTests

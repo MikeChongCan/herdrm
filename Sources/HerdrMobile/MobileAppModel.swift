@@ -20,13 +20,18 @@ final class MobileDeviceSession {
     /// Bumped on every transport swap — see `MobileTransportProvider`.
     private(set) var transportRevision = 0
     private var eventTask: Task<Void, Never>?
-    private var refreshPending = false
     /// The in-flight connect, so a foreground pass, a Reconnect tap and an
     /// attach all resolving at once share one rebuild instead of racing.
     private var connectTask: Task<Void, Never>?
     /// Set when iOS backgrounds us. A held session stops being trustworthy from
     /// that moment until something proves it again.
     private var wasSuspended = false
+    private var refreshDebounceTask: Task<Void, Never>?
+    private var refreshDebouncePending = false
+    private var snapshotRefreshTask: Task<Bool, Never>?
+    private var snapshotRefreshToken: UUID?
+    private var refreshRequested = false
+    private var statusGeneration: UInt64 = 0
 
     var onChange: (() -> Void)?
 
@@ -64,7 +69,13 @@ final class MobileDeviceSession {
         state = .connecting
         onChange?()
         do {
-            let transport = try await SSHDirectTransport.connect(device: device)
+            let transport: MobileTransport
+            switch device.kind {
+            case .ssh:
+                transport = try await SSHDirectTransport.connect(device: device)
+            case .tailcat:
+                transport = try await TailcatMobileTransport.connect(device: device)
+            }
             let pong = try await transport.request(
                 method: "ping", params: .object([:]), as: PingResult.self
             )
@@ -115,6 +126,13 @@ final class MobileDeviceSession {
     func disconnect() async {
         connectTask?.cancel()
         connectTask = nil
+        refreshDebounceTask?.cancel()
+        refreshDebounceTask = nil
+        refreshDebouncePending = false
+        snapshotRefreshTask?.cancel()
+        snapshotRefreshTask = nil
+        snapshotRefreshToken = nil
+        refreshRequested = false
         await teardown()
         state = .idle
         onChange?()
@@ -136,17 +154,53 @@ final class MobileDeviceSession {
         transportRevision += 1
     }
 
-    func refresh() async {
-        guard let transport else { return }
+    @discardableResult
+    func refresh() async -> Bool {
+        refreshRequested = true
+        if let task = snapshotRefreshTask {
+            return await task.value
+        }
+        let token = UUID()
+        snapshotRefreshToken = token
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            var latestSucceeded = false
+            while !Task.isCancelled, self.refreshRequested {
+                self.refreshRequested = false
+                latestSucceeded = await self.performRefresh()
+            }
+            if self.snapshotRefreshToken == token {
+                self.snapshotRefreshToken = nil
+                self.snapshotRefreshTask = nil
+            }
+            return latestSucceeded
+        }
+        snapshotRefreshTask = task
+        return await task.value
+    }
+
+    private func performRefresh() async -> Bool {
+        guard let transport else { return false }
+        let generation = statusGeneration
         struct Envelope: Codable { let snapshot: SessionSnapshot }
         do {
-            snapshot = try await transport.request(
+            let fetched = try await transport.request(
                 method: "session.snapshot", as: Envelope.self
             ).snapshot
+            guard !Task.isCancelled, self.transport === transport else {
+                return false
+            }
+            guard statusGeneration == generation else {
+                refreshRequested = true
+                return true
+            }
+            snapshot = fetched
             onChange?()
+            return true
         } catch {
             // A failed refresh keeps the last snapshot; the event pump's own
             // failure handling decides when the connection is actually gone.
+            return false
         }
     }
 
@@ -155,8 +209,45 @@ final class MobileDeviceSession {
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             do {
-                for try await _ in transport.events(kinds: HerdrEvent.allKinds) {
-                    await self?.scheduleRefresh()
+                eventSubscriptions: while !Task.isCancelled {
+                    guard let self else { return }
+                    let subscribedPaneIDs = self.statusSubscriptionPaneIDs
+                    let stream = transport.events(
+                        kinds: HerdrEvent.allKinds,
+                        statusPaneIDs: subscribedPaneIDs
+                    )
+                    var needsResubscribe = false
+                    var resubscribeDelay = Duration.milliseconds(100)
+                    for try await event in stream {
+                        guard !Task.isCancelled else { return }
+                        if event.kind == HerdrEvent.agentStatusChangedKind,
+                           self.applyAgentStatusEvent(event) {
+                            self.scheduleRefresh()
+                        } else if event.kind == HerdrEvent.subscriptionStartedKind
+                            || event.kind == HerdrEvent.agentStatusChangedKind
+                            || Self.paneTopologyEventKinds.contains(event.kind) {
+                            if !(await self.refresh()) {
+                                needsResubscribe = true
+                                resubscribeDelay = .milliseconds(500)
+                                break
+                            }
+                        } else {
+                            self.scheduleRefresh()
+                        }
+
+                        if event.kind == HerdrEvent.subscriptionStartedKind
+                            || Self.paneTopologyEventKinds.contains(event.kind),
+                           self.statusSubscriptionPaneIDs != subscribedPaneIDs {
+                            needsResubscribe = true
+                            break
+                        }
+                    }
+                    if needsResubscribe {
+                        try? await Task.sleep(for: resubscribeDelay)
+                        continue eventSubscriptions
+                    }
+                    guard !Task.isCancelled else { return }
+                    throw HerdrError.connectionFailed("event stream ended")
                 }
             } catch {}
             // Stream ended: the connection is likely gone. Reflect it so the
@@ -170,13 +261,51 @@ final class MobileDeviceSession {
     }
 
     /// Coalesces event bursts into one snapshot fetch per 300 ms.
-    private func scheduleRefresh() async {
-        guard !refreshPending else { return }
-        refreshPending = true
-        try? await Task.sleep(for: .milliseconds(300))
-        refreshPending = false
-        await refresh()
+    private func scheduleRefresh() {
+        guard refreshDebounceTask == nil else {
+            refreshDebouncePending = true
+            return
+        }
+        refreshDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self, !Task.isCancelled else { return }
+            await self.refresh()
+            self.refreshDebounceTask = nil
+            if self.refreshDebouncePending {
+                self.refreshDebouncePending = false
+                self.scheduleRefresh()
+            }
+        }
     }
+
+    private var statusSubscriptionPaneIDs: [String] {
+        guard let snapshot else { return [] }
+        return Array(Set(
+            snapshot.agents.map(\.paneID)
+                + snapshot.ordinaryTerminalPanes.map(\.paneID)
+        )).sorted()
+    }
+
+    private func applyAgentStatusEvent(_ event: HerdrEvent) -> Bool {
+        guard let paneID = event.payload["data"]?["pane_id"]?.stringValue,
+              let statusRaw = event.payload["data"]?["agent_status"]?.stringValue,
+              let updated = snapshot?.updatingAgentStatus(
+                  paneID: paneID,
+                  status: AgentStatus(wire: statusRaw)
+              )
+        else { return false }
+        snapshot = updated
+        statusGeneration &+= 1
+        onChange?()
+        return true
+    }
+
+    private static let paneTopologyEventKinds: Set<String> = [
+        "pane.created",
+        "pane.closed",
+        "pane.moved",
+        "pane.agent_detected",
+    ]
 }
 
 extension MobileDeviceSession: MobileTransportProvider {
@@ -395,6 +524,28 @@ final class MobileAppModel {
         }
     }
 
+    /// Adds a tailcat device: the token goes to the Keychain (keyed by the
+    /// new device id), never into the device list. Same posture as the Mac
+    /// app's `addTailcatDevice`; no host probe — tailcat has no shell.
+    func addTailcatDevice(name: String, token: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let device = MobileDevice(
+            kind: .tailcat,
+            name: trimmedName.isEmpty ? String(localized: "Tailcat device") : trimmedName
+        )
+        do {
+            try TailcatCredentialStore.setToken(token, for: device.id)
+        } catch {
+            return
+        }
+        devices.append(device)
+        if defaultDeviceID == nil {
+            defaultDeviceID = device.id
+        }
+        persistDevices()
+        selectDevice(device.id)
+    }
+
     /// The line to enroll on a Mac: `echo '<line>' >> ~/.ssh/authorized_keys`.
     var deviceKeyAuthorizedLine: String {
         DeviceKey.authorizedKeysLine(DeviceKey.ensure())
@@ -405,6 +556,10 @@ final class MobileAppModel {
             Task { await session.disconnect() }
         }
         MobileSecretStore.removePassword(for: device.id)
+        if device.isTailcat {
+            TailcatCredentialStore.removeToken(for: device.id)
+            Task { await TailcatBridgeManager.shared.tearDown(deviceID: device.id) }
+        }
         KnownHostsStore.unpin(host: device.host, port: device.port)
         devices.removeAll { $0.id == device.id }
         if defaultDeviceID == device.id {

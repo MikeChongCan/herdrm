@@ -147,6 +147,14 @@ brew install owo-network/brew/herdrm
 unzip, drag `herdrm.app` into `/Applications`. Either way it self-updates from then on — **HerdrM
 → Check for Updates…**, or **HerdrM → About HerdrM** for the version you're running.
 
+> [!WARNING]
+> The **only** official sources for herdrm are this repository
+> (`github.com/missuo/herdrm`) and the Homebrew cask above. Every genuine build
+> is signed by *MOE AI LLC* and notarized by Apple. Third-party "download" sites
+> or mirrors are not affiliated with the project and have been used to distribute
+> unrelated (Windows) payloads under the herdrm name — don't run anything from
+> them.
+
 ## ⚡ Quick Start
 
 ```text
@@ -196,12 +204,22 @@ Early-stage software, PRs genuinely welcome — small and single-purpose lands f
 ## 🙏 Credits
 
 - [herdr](https://herdr.dev) — the agent runtime this app is a console for.
+- [@lbr77](https://github.com/lbr77) — the [herdr.tailcat](https://github.com/lbr77/herdr-plugin-tailcat)
+  server plugin, the embedded tailcat bridge, and the reference implementation
+  the libghostty terminal migration is built on ([lbr77/herdrm](https://github.com/lbr77/herdrm)).
 - [Heeler](https://github.com/ZingerLittleBee/Heeler) — iOS herdr client; domain model and
   transport patterns.
 - [waku](https://github.com/egoist/waku) — sidebar design reference.
-- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — terminal emulation.
+- [libghostty-spm](https://github.com/Lakr233/libghostty-spm) — the Ghostty terminal engine
+  (Metal), by [@Lakr233](https://github.com/Lakr233).
 - [Sparkle](https://sparkle-project.org) — auto-updates.
 - [Lobe Icons](https://github.com/lobehub/lobe-icons) / [Simple Icons](https://simpleicons.org) — brand icons.
+
+## 📄 License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, modify, and share for
+any **noncommercial** purpose. Commercial use requires a separate license from
+the maintainer. Contributions are accepted under the same terms.
 
 ## <a name="-status"></a>⚠️ Status
 
